@@ -13,7 +13,7 @@ from aimodels.dashboard import App, Paths
 TMP_DB_PATH = "/tmp/models.db"
 BLOB_FILENAME = "models.db"
 TOKEN = os.environ.get("BLOB_READ_WRITE_TOKEN")
-BLOB_API = "https://blob.vercel-storage.com"
+BLOB_API = "https://vercel-storage.com"
 
 def download_db():
     if os.path.exists(TMP_DB_PATH): return
@@ -140,3 +140,7 @@ def app(environ, start_response):
 
     start_response("404 Not Found", [("Content-Type", "text/plain")])
     return [b"Not Found"]
+
+# 5. VERCEL ENTRYPOINT EXPORT
+# This assignment makes the application visible to Vercel's runtime routing engine.
+handler = app
