@@ -19,24 +19,41 @@ def download_db():
     if os.path.exists(TMP_DB_PATH): return
     try:
         headers = {"Authorization": f"Bearer {TOKEN}"}
+        # List blobs matching the filename prefix
         r = requests.get(f"{BLOB_API}?prefix={BLOB_FILENAME}", headers=headers)
         blobs = r.json().get("blobs", [])
         if blobs:
+            # Download the file content using its unique public URL
+            blob_url = blobs[0]["url"]
             with open(TMP_DB_PATH, "wb") as f:
-                f.write(requests.get(blobs[0]["url"], headers=headers).content)
+                f.write(requests.get(blob_url).content)
     except Exception as e:
         print(f"Download error: {e}")
 
 def upload_db():
+    if not os.path.exists(TMP_DB_PATH): return
     try:
         with open(TMP_DB_PATH, "rb") as f:
-            requests.post(
-                BLOB_API,
-                headers={"Authorization": f"Bearer {TOKEN}", "x-api-version": "1"},
-                files={"file": (BLOB_FILENAME, f, "application/x-sqlite3")},
-                data={"access": "public"},
-                timeout=30
-            )
+            binary_data = f.read()
+
+        # Vercel Blob API expects raw body data instead of multipart/form-data
+        headers = {
+            "Authorization": f"Bearer {TOKEN}",
+            "x-api-version": "1",
+            "X-Blob-Store-Timeout": "30"
+        }
+        
+        # Target the specific destination path on Vercel Blob
+        upload_url = f"{BLOB_API}/{BLOB_FILENAME}"
+        
+        r = requests.put(
+            upload_url,
+            headers=headers,
+            data=binary_data,
+            timeout=30
+        )
+        if r.status_code not in:
+            print(f"Upload failed status code: {r.status_code}, response: {r.text}")
     except Exception as e:
         print(f"Upload error: {e}")
 
@@ -44,7 +61,11 @@ def upload_db():
 paths = Paths()
 paths.live_db = Path(TMP_DB_PATH)
 paths.sample_db = Path(TMP_DB_PATH)
-paths.raw = Path("/tmp/raw")  # <--- THIS FIXES THE ERRNO 30 ERROR
+paths.raw = Path("/tmp/raw")
+
+# Ensure /tmp/raw exists so the ETL pipeline doesn't throw a FileNotFoundError
+paths.raw.mkdir(parents=True, exist_ok=True)
+
 app_instance = App(paths)
 
 # 4. ROUTER
@@ -77,7 +98,9 @@ def app(environ, start_response):
                 try:
                     from aimodels.pipeline import run_etl
                     
-                    # Pass BOTH db_path and raw_dir to /tmp
+                    # Ensure directories exist right before running the pipeline 
+                    Path("/tmp/raw").mkdir(parents=True, exist_ok=True)
+                    
                     summary = run_etl(
                         offline=False, use_cache=False, skip_hf=False, 
                         db_path=Path(TMP_DB_PATH),
