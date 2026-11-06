@@ -1,0 +1,3 @@
+[console_scripts]
+aimodels = aimodels.__main__:main
+aimodels-dashboard = aimodels.dashboard:serve

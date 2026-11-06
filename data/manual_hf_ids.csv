@@ -1,0 +1,7 @@
+# Hand-curated Hugging Face repos for open-weight models that OpenRouter does not list.
+# match_key must equal the normalized name key (see `python -c "from aimodels.normalize import normalize_name as n; print(n('Llama 3.1 Instruct 8B').key)"`).
+match_key,hf_repo_id
+llama-3-1-8b,meta-llama/Llama-3.1-8B-Instruct
+llama-3-1-70b,meta-llama/Llama-3.1-70B-Instruct
+qwen2-5-72b,Qwen/Qwen2.5-72B-Instruct
+mistral-7b-v0-3,mistralai/Mistral-7B-Instruct-v0.3

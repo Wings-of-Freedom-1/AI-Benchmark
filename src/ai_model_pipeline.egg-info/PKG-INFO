@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: ai-model-pipeline
+Version: 0.1.0
+Summary: ETL + EDA pipeline comparing AI models on performance vs size, cost and speed
+Requires-Python: >=3.10
+Requires-Dist: requests>=2.31
+Requires-Dist: pandas>=2.2
+Requires-Dist: numpy>=1.26
+Requires-Dist: pydantic>=2.6
+Requires-Dist: matplotlib>=3.8
+Requires-Dist: dotenv>=0.9.9
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"

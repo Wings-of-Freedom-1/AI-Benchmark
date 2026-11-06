@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="dashboard-token" content="__TOKEN__">
+<title>Model Console</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3.5v8M7.2 6.6a7.2 7.2 0 1 0 9.6 0" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+  <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 3 2.5 20h19L12 3z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M12 10v5m0 3v.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+  <symbol id="i-ok" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="m8 12.5 3 3 5-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-theme" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 0 1 9.5 4 8 8 0 1 0 20 14.5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></symbol>
+  <symbol id="i-save" viewBox="0 0 24 24"><path d="M5 4h11l3 3v13H5zM8 4v5h7V4M8 20v-6h8v6" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></symbol>
+  <symbol id="i-csv" viewBox="0 0 24 24"><path d="M12 3v12m0 0-4-4m4 4 4-4M5 20h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+</svg>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 12 16.5 7.5" stroke="var(--warm)" stroke-width="2.4" stroke-linecap="round"/><circle cx="12" cy="12" r="1.6" fill="currentColor"/></svg></span>
+    <div><h1>Model Console</h1><p>Which AI models give the most for their size, cost and speed?</p></div>
+  </div>
+  <span id="dataBadge" class="badge" role="status"></span>
+  <div class="tools">
+    <label class="sr" for="scene">Scene</label>
+    <select id="scene" class="pill" title="Scenes are saved positions of every control"></select>
+    <button class="pill" id="saveScene" title="Save the current control positions as a scene"><svg><use href="#i-save"/></svg>Save scene</button>
+    <button class="pill" id="themeBtn" title="Switch theme"><svg><use href="#i-theme"/></svg><span id="themeLbl">Auto</span></button>
+  </div>
+</header>
+
+<main>
+  <section class="surface" aria-label="Control surface">
+
+    <!-- PIPELINE -->
+    <article class="panel" id="pLeft" aria-labelledby="tLeft">
+      <header class="panel-head">
+        <button class="power" id="runBtn" aria-pressed="false" aria-label="Run the pipeline" title="Run the pipeline (extract, transform, validate, load, then build the report)"><svg><use href="#i-power"/></svg></button>
+        <span class="panel-title" id="tLeft">Pipeline</span>
+        <div class="seg small" id="dsSeg" role="radiogroup" aria-label="Dataset">
+          <button role="radio" data-v="sample" title="Synthetic demo data, works offline">Demo</button>
+          <button role="radio" data-v="live" title="Real data from the three APIs">Live</button>
+        </div>
+      </header>
+      <div class="panel-body">
+        <div data-knob="fuzzy"></div>
+        <div data-knob="tol" class="small"></div>
+        <div class="stepper" id="stepper" aria-label="Pipeline progress"></div>
+        <div class="statusline" id="runStatus"></div>
+      </div>
+      <div class="adv" id="advLeft" hidden>
+        <div class="row"><label class="lbl" for="swCache">Reuse last download (no API calls)</label><button class="mini-switch" role="switch" id="swCache"></button></div>
+        <div class="row"><label class="lbl" for="swSkipHf">Skip Hugging Face sizes</label><button class="mini-switch" role="switch" id="swSkipHf"></button></div>
+        <div class="row"><label class="lbl" for="swEda">Build the report after the ETL</label><button class="mini-switch" role="switch" id="swEda"></button></div>
+        <div><label class="lbl" for="keyAA">Artificial Analysis API key <span id="keyAAState" class="tag"></span></label><input type="password" id="keyAA" autocomplete="off" placeholder="paste key for this session" spellcheck="false"></div>
+        <div><label class="lbl" for="keyHF">Hugging Face token (optional) <span id="keyHFState" class="tag"></span></label><input type="password" id="keyHF" autocomplete="off" placeholder="raises the rate limit" spellcheck="false"></div>
+        <div class="btns"><button class="pill" id="saveKeys">Use keys</button><button class="pill" id="forgetKeys">Forget keys</button><a class="pill" href="https://artificialanalysis.ai/" target="_blank" rel="noopener noreferrer">Get a free key</a></div>
+        <div class="btns"><button class="pill" id="testConn" title="Checks the key and the three websites, using one of your free daily Artificial Analysis requests">Test connections</button></div>
+        <div id="connResult" class="conn" aria-live="polite"></div>
+        <p class="hint">Keys stay in this program's memory only. They are never written to disk and vanish when you close the console.</p>
+        <div class="btns"><button class="pill" id="runEtlOnly">Run ETL only</button><button class="pill" id="runEdaOnly">Rebuild report only</button></div>
+        <p class="hint" id="cacheNote"></p>
+      </div>
+      <footer class="panel-foot"><span>ADV</span><button class="switch" role="switch" id="advLeftSw" aria-label="Advanced pipeline options"></button></footer>
+    </article>
+
+    <!-- RANKER -->
+    <article class="panel" id="pMid" aria-labelledby="tMid">
+      <header class="panel-head">
+        <button class="power" id="rankPower" aria-pressed="true" aria-label="Weighted ranking on" title="On: rank with the four faders. Off: rank by quality alone."><svg><use href="#i-power"/></svg></button>
+        <span class="panel-title" id="tMid">Ranker</span>
+      </header>
+      <div class="panel-body">
+        <div class="screen" id="miniScreen"></div>
+        <div class="faders">
+          <div class="fader-wrap" data-fader="wq"></div>
+          <div class="fader-wrap" data-fader="wc"></div>
+          <div class="fader-wrap" data-fader="ws"></div>
+          <div class="fader-wrap" data-fader="wz"></div>
+        </div>
+        <div class="seg" id="modeSeg" role="radiogroup" aria-label="Ranking method">
+          <button role="radio" data-v="weighted" title="Blend the four percentile scores using the faders">Weighted</button>
+          <button role="radio" data-v="pareto" title="Layer 1 = nothing beats it on every weighted dimension">Pareto</button>
+          <button role="radio" data-v="perdollar" title="Quality points per dollar, among above-median models">Per $</button>
+        </div>
+      </div>
+      <div class="adv" id="advMid" hidden>
+        <div><label class="lbl" for="scoreSel">Quality metric</label><select id="scoreSel"></select></div>
+        <div><span class="lbl">Missing values</span>
+          <div class="seg small" id="missSeg" role="radiogroup" aria-label="Missing values">
+            <button role="radio" data-v="neutral" title="Treat a missing value as the median (50th percentile)">Neutral</button>
+            <button role="radio" data-v="skip" title="Ignore that dimension for the model and re-weight the rest">Skip</button>
+            <button role="radio" data-v="exclude" title="Leave out models missing any weighted dimension">Exclude</button>
+          </div></div>
+        <div><label class="lbl" for="topNSel">Highlight top</label>
+          <select id="topNSel"><option>5</option><option>10</option><option>25</option><option>50</option></select></div>
+        <p class="hint">Each dimension is a percentile among all models in the database, so a model's score does not change when you filter. Cost and size count lower as better.</p>
+      </div>
+      <footer class="panel-foot"><span>ADV</span><button class="switch" role="switch" id="advMidSw" aria-label="Advanced ranking options"></button></footer>
+    </article>
+
+    <!-- FILTERS -->
+    <article class="panel" id="pRight" aria-labelledby="tRight">
+      <header class="panel-head">
+        <button class="power" id="filtPower" aria-pressed="true" aria-label="Filters on" title="On: apply the filters. Off: show every model."><svg><use href="#i-power"/></svg></button>
+        <span class="panel-title" id="tRight">Filters</span>
+      </header>
+      <div class="panel-body">
+        <div class="knob-row"><div data-knob="sizeMin"></div><div data-knob="sizeMax"></div></div>
+        <button class="link-btn" id="linkBtn" aria-pressed="false" aria-label="Link minimum and maximum size so the window moves together" title="Link the two size knobs"><span class="bracket"><span class="chain"><svg><use href="#i-link"/></svg></span></span></button>
+        <div class="knob-row"><div data-knob="minScore"></div><div data-knob="maxPrice"></div></div>
+        <div data-knob="since"></div>
+      </div>
+      <div class="adv" id="advRight" hidden>
+        <div><span class="lbl">Model type</span>
+          <div class="seg small" id="openSeg" role="radiogroup" aria-label="Open or closed models">
+            <button role="radio" data-v="all">All</button><button role="radio" data-v="open" title="A Hugging Face repo was found">Open</button><button role="radio" data-v="closed">Closed</button>
+          </div></div>
+        <div><span class="lbl">Creators <span class="hint">(none selected = all)</span></span><div class="chips chip-scroll" id="creatorChips"></div></div>
+        <div class="row"><label class="lbl" for="swComplete">Only models with score, price and speed</label><button class="mini-switch" role="switch" id="swComplete"></button></div>
+        <div class="row"><label class="lbl" for="swNoReason">Hide reasoning variants</label><button class="mini-switch" role="switch" id="swNoReason"></button></div>
+        <div class="row"><label class="lbl" for="swKeepSize">Keep unknown sizes when size-filtering</label><button class="mini-switch" role="switch" id="swKeepSize"></button></div>
+        <div class="btns"><button class="pill" id="resetFilters">Reset all filters</button></div>
+      </div>
+      <footer class="panel-foot"><span>ADV</span><button class="switch" role="switch" id="advRightSw" aria-label="Advanced filter options"></button></footer>
+    </article>
+  </section>
+
+  <section class="verdict" id="verdict" aria-live="polite"></section>
+
+  <section class="display" aria-label="Analysis">
+    <nav class="tabs" id="tabs" role="tablist" aria-label="Views"></nav>
+    <div class="toolbar" id="globalBar">
+      <input type="search" id="searchBox" placeholder="Search model or creator" aria-label="Search model or creator" autocomplete="off">
+      <span class="count" id="count"></span>
+    </div>
+    <div id="view" role="tabpanel"></div>
+  </section>
+</main>
+
+<footer class="foot"><span id="attr"></span><span id="runInfo"></span></footer>
+<div id="tip" hidden></div>
+<div id="toast" role="status" aria-live="polite"></div>
+<div id="lightbox" hidden><img alt=""></div>
+
+<script src="/static/charts.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
