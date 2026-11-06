@@ -1,27 +1,31 @@
 import sys
 import os
 import json
+import requests
 from urllib.parse import parse_qs
-from vercel_blob import put, list
 
 # Add the 'src' directory to the Python path
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
+
+# 1. Import the official Vercel Blob SDK
+from vercel.blob import sync as blob
 
 from aimodels.dashboard import App, Paths
 
-# Define where Vercel is allowed to write
 TMP_DB_PATH = "/tmp/models.db"
 BLOB_FILENAME = "models.db"
+BLOB_TOKEN = os.environ.get("BLOB_READ_WRITE_TOKEN")
 
 def sync_db_from_cloud():
     """Download the latest database from Vercel Blob to /tmp"""
     if os.path.exists(TMP_DB_PATH):
-        return  # Already downloaded for this serverless instance
+        return
     try:
-        blobs = list({"prefix": BLOB_FILENAME})
-        if blobs:
-            import requests
-            r = requests.get(blobs[0]['url'])
+        # Use the official SDK to list and download
+        res = blob.list_blobs(prefix=BLOB_FILENAME, token=BLOB_TOKEN)
+        if res.blobs:
+            url = res.blobs[0].url
+            r = requests.get(url)
             with open(TMP_DB_PATH, 'wb') as f:
                 f.write(r.content)
     except Exception as e:
@@ -31,7 +35,14 @@ def sync_db_to_cloud():
     """Upload the updated database from /tmp back to Vercel Blob"""
     try:
         with open(TMP_DB_PATH, 'rb') as f:
-            put(BLOB_FILENAME, f.read(), {"access": "public", "allowOverwrite": True})
+            # Use the official SDK to upload
+            blob.put_blob(
+                BLOB_FILENAME, 
+                f.read(), 
+                access="public", 
+                allow_overwrite=True,
+                token=BLOB_TOKEN
+            )
     except Exception as e:
         print(f"Error uploading DB: {e}")
 
@@ -47,10 +58,8 @@ def app(environ, start_response):
     query = parse_qs(environ.get('QUERY_STRING', ''))
     which = "live"
 
-    # Sync database from cloud on first request
     sync_db_from_cloud()
 
-    # --- SERVE API ROUTES ---
     if path.startswith('/api/'):
         if method == 'GET':
             if path == '/api/status': data = app_instance.status()
@@ -70,12 +79,8 @@ def app(environ, start_response):
             return [res]
 
         elif method == 'POST':
-            # Allow the "Run ETL" button to work!
             if path == '/api/run':
                 try:
-                    length = int(environ.get('CONTENT_LENGTH', 0))
-                    body = json.loads(environ['wsgi.input'].read(length))
-                    
                     # Trigger your pipeline
                     from aimodels.pipeline import run_etl
                     summary = run_etl(offline=False, use_cache=False, skip_hf=False, db_path=TMP_DB_PATH)
@@ -93,7 +98,7 @@ def app(environ, start_response):
             start_response('404 Not Found', [('Content-Type', 'text/plain')])
             return [b'Not Found']
 
-    # --- SERVE FRONTEND ---
+    # Serve Frontend
     web_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src', 'aimodels', 'web'))
     if path == '/' or path == '/index.html':
         filepath = os.path.join(web_dir, 'index.html')
