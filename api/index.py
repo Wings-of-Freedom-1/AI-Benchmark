@@ -5,78 +5,54 @@ import requests
 from urllib.parse import parse_qs
 from pathlib import Path
 
-# Add the 'src' directory to the Python path
+# 1. PATH SETUP
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
-
 from aimodels.dashboard import App, Paths
 
-# --- BLOB STORAGE CONFIG ---
+# 2. VERCEL BLOB CONFIG
 TMP_DB_PATH = "/tmp/models.db"
 BLOB_FILENAME = "models.db"
 TOKEN = os.environ.get("BLOB_READ_WRITE_TOKEN")
 BLOB_API = "https://blob.vercel-storage.com"
 
-def sync_db_from_cloud():
-    """Download the latest database from Vercel Blob to /tmp"""
-    if os.path.exists(TMP_DB_PATH):
-        return
+def download_db():
+    if os.path.exists(TMP_DB_PATH): return
     try:
         headers = {"Authorization": f"Bearer {TOKEN}"}
-        r = requests.get(f"{BLOB_API}?prefix={BLOB_FILENAME}", headers=headers, timeout=10)
-        r.raise_for_status()
+        r = requests.get(f"{BLOB_API}?prefix={BLOB_FILENAME}", headers=headers)
         blobs = r.json().get("blobs", [])
-        if not blobs:
-            print("No database found in Blob storage. Starting fresh.")
-            return
-        
-        download_url = blobs[0]["url"]
-        r = requests.get(download_url, headers=headers, timeout=10)
-        r.raise_for_status()
-        with open(TMP_DB_PATH, "wb") as f:
-            f.write(r.content)
-        print("Successfully downloaded DB from Blob.")
+        if blobs:
+            with open(TMP_DB_PATH, "wb") as f:
+                f.write(requests.get(blobs[0]["url"], headers=headers).content)
     except Exception as e:
-        print(f"Error downloading DB: {e}")
+        print(f"Download error: {e}")
 
-def sync_db_to_cloud():
-    """Upload the updated database from /tmp back to Vercel Blob"""
+def upload_db():
     try:
         with open(TMP_DB_PATH, "rb") as f:
-            files = {"file": (BLOB_FILENAME, f, "application/x-sqlite3")}
-            headers = {
-                "Authorization": f"Bearer {TOKEN}",
-                "x-api-version": "1",
-            }
-            # You can change access to "private" if you prefer, but "public" makes serving easier.
-            r = requests.post(
+            requests.post(
                 BLOB_API,
-                headers=headers,
-                files=files,
-                data={"access": "public"}, 
-                timeout=30,
+                headers={"Authorization": f"Bearer {TOKEN}", "x-api-version": "1"},
+                files={"file": (BLOB_FILENAME, f, "application/x-sqlite3")},
+                data={"access": "public"},
+                timeout=30
             )
-            r.raise_for_status()
-            print("Successfully uploaded DB to Blob.")
     except Exception as e:
-        print(f"Error uploading DB: {e}")
+        print(f"Upload error: {e}")
 
-# --- APP SETUP ---
-# Create App instance and point ALL file writing to /tmp
+# 3. APP SETUP (Pointing to /tmp to prevent Read-only errors)
 paths = Paths()
 paths.live_db = Path(TMP_DB_PATH)
 paths.sample_db = Path(TMP_DB_PATH)
-paths.raw = Path("/tmp/raw")             # Prevents raw JSON write error
-paths.reports = Path("/tmp/reports")     # Prevents chart generation write error
-
+paths.raw = Path("/tmp/raw")  # <--- THIS FIXES THE ERRNO 30 ERROR
 app_instance = App(paths)
 
-# --- WSGI ROUTER ---
+# 4. ROUTER
 def app(environ, start_response):
     path = environ.get("PATH_INFO", "/")
     method = environ.get("REQUEST_METHOD", "GET")
     
-    # Ensure we have the latest DB downloaded before doing anything
-    sync_db_from_cloud()
+    download_db()
 
     if path.startswith("/api/"):
         if method == "GET":
@@ -90,7 +66,7 @@ def app(environ, start_response):
 
             if data is None:
                 start_response("404 Not Found", [("Content-Type", "application/json")])
-                return [b'{"error": "no data yet - run ETL"}']
+                return [b'{"error": "no data yet"}']
 
             res = json.dumps(data, default=str).encode("utf-8")
             start_response("200 OK", [("Content-Type", "application/json"), ("Content-Length", str(len(res)))])
@@ -101,33 +77,26 @@ def app(environ, start_response):
                 try:
                     from aimodels.pipeline import run_etl
                     
-                    # Pass the /tmp/raw directory to the pipeline to fix the Read-only error!
+                    # Pass BOTH db_path and raw_dir to /tmp
                     summary = run_etl(
-                        offline=False, 
-                        use_cache=False, 
-                        skip_hf=False, 
+                        offline=False, use_cache=False, skip_hf=False, 
                         db_path=Path(TMP_DB_PATH),
-                        raw_dir=Path("/tmp/raw") 
+                        raw_dir=Path("/tmp/raw")
                     )
-                    
-                    # Upload the new database to the cloud
-                    sync_db_to_cloud()
+                    upload_db()
                     
                     res = json.dumps({"status": "done", "n_valid": summary.n_valid}).encode("utf-8")
                     start_response("200 OK", [("Content-Type", "application/json")])
                     return [res]
                 except Exception as e:
-                    import traceback
-                    traceback.print_exc()
                     start_response("500 Internal Error", [("Content-Type", "application/json")])
                     return [json.dumps({"error": str(e)}).encode("utf-8")]
 
             start_response("404 Not Found", [("Content-Type", "text/plain")])
             return [b"Not Found"]
 
-    # --- SERVE FRONTEND ---
+    # SERVE FRONTEND
     web_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src", "aimodels", "web"))
-    
     if path == "/" or path == "/index.html":
         filepath = os.path.join(web_dir, "index.html")
         if os.path.exists(filepath):
