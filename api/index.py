@@ -91,21 +91,31 @@ def app(environ, start_response):
             start_response("200 OK", [("Content-Type", "application/json"), ("Content-Length", str(len(res)))])
             return [res]
 
-        elif method == "POST":
-            if path == "/api/run":
+        elif method == 'POST':
+            if path == '/api/run':
                 try:
+                    # Trigger your pipeline
                     from aimodels.pipeline import run_etl
-                    summary = run_etl(offline=False, use_cache=False, skip_hf=False, db_path=TMP_DB_PATH)
+                    import pathlib
+                    
+                    # WE ADDED raw_dir='/tmp/raw' HERE 👇
+                    summary = run_etl(
+                        offline=False, 
+                        use_cache=False, 
+                        skip_hf=False, 
+                        db_path=TMP_DB_PATH,
+                        raw_dir=pathlib.Path("/tmp/raw") 
+                    )
+                    
+                    # Save the new database to the cloud
                     sync_db_to_cloud()
-                    res = json.dumps({"status": "done", "n_valid": summary.n_valid}).encode("utf-8")
-                    start_response("200 OK", [("Content-Type", "application/json")])
+                    
+                    res = json.dumps({"status": "done", "n_valid": summary.n_valid}).encode('utf-8')
+                    start_response('200 OK', [('Content-Type', 'application/json')])
                     return [res]
                 except Exception as e:
-                    start_response("500 Internal Error", [("Content-Type", "application/json")])
-                    return [json.dumps({"error": str(e)}).encode("utf-8")]
-
-            start_response("404 Not Found", [("Content-Type", "text/plain")])
-            return [b"Not Found"]
+                    start_response('500 Internal Error', [('Content-Type', 'application/json')])
+                    return [json.dumps({"error": str(e)}).encode('utf-8')]
 
     # Serve Frontend
     web_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src", "aimodels", "web"))
