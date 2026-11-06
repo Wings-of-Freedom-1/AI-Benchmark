@@ -1,4 +1,5 @@
 import sys, os, json, shutil, time, traceback
+from urllib.parse import parse_qs
 from pathlib import Path
 import requests
 
@@ -95,13 +96,22 @@ def respond(start_response, status, body, ctype="application/json"):
     return [body]
 
 
-def app(environ, start_response):
+def application(environ, start_response):
+    # The rewrite in vercel.json passes the real path in ?p=
     path = environ.get("PATH_INFO", "/")
+    qs = parse_qs(environ.get("QUERY_STRING", ""))
+    if "p" in qs:
+        path = qs["p"][0]
+    elif path in ("/api/index", "/api/index.py"):
+        path = "/"
+    if not path.startswith("/"):
+        path = "/" + path
     method = environ.get("REQUEST_METHOD", "GET")
 
     try:
         if path.startswith("/api/"):
             ensure_db()
+
             if method == "GET":
                 routes = {
                     "/api/status": lambda: app_instance.status(),
@@ -112,4 +122,41 @@ def app(environ, start_response):
                 if path not in routes:
                     return respond(start_response, "404 Not Found", {"error": "not found"})
                 data = routes[path]()
-                if data is
+                if data is None:
+                    return respond(start_response, "404 Not Found",
+                                   {"error": "no data yet - run ETL"})
+                return respond(start_response, "200 OK", data)
+
+            if method == "POST" and path == "/api/run":
+                from aimodels.pipeline import run_etl
+                summary = run_etl(offline=False, use_cache=False, skip_hf=False,
+                                  db_path=TMP_DB, raw_dir=TMP_RAW)
+                upload_to_blob()
+                return respond(start_response, "200 OK",
+                               {"status": "done", "n_valid": getattr(summary, "n_valid", None)})
+
+            return respond(start_response, "404 Not Found", {"error": "not found"})
+
+        # ---- Frontend ----
+        web_dir = ROOT / "src" / "aimodels" / "web"
+
+        if path in ("/", "/index.html"):
+            html = (web_dir / "index.html").read_text(encoding="utf-8")
+            html = html.replace("__TOKEN__", str(getattr(app_instance, "token", "")))
+            return respond(start_response, "200 OK", html, "text/html; charset=utf-8")
+
+        if path.startswith("/static/"):
+            fp = (web_dir / path[len("/static/"):]).resolve()
+            if web_dir.resolve() in fp.parents and fp.is_file():
+                ctype = {".css": "text/css", ".js": "application/javascript"}.get(
+                    fp.suffix, "application/octet-stream")
+                return respond(start_response, "200 OK", fp.read_bytes(), ctype)
+
+        return respond(start_response, "404 Not Found", "Not Found", "text/plain")
+
+    except Exception as e:
+        traceback.print_exc()
+        return respond(start_response, "500 Internal Server Error", {"error": str(e)})
+
+
+app = application
