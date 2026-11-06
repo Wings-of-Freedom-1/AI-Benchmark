@@ -1,146 +1,115 @@
-import sys
-import os
-import json
-import requests
-from urllib.parse import parse_qs
+import sys, os, json, shutil, time, traceback
 from pathlib import Path
+import requests
 
-# 1. PATH SETUP
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
-from aimodels.dashboard import App, Paths
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-# 2. VERCEL BLOB CONFIG
-TMP_DB_PATH = "/tmp/models.db"
-BLOB_FILENAME = "models.db"
+ROOT = Path(__file__).resolve().parent.parent
+TMP_DB = Path("/tmp/models.db")
+TMP_RAW = Path("/tmp/raw")
+BUNDLED_DB = ROOT / "data" / "models.db"
+BLOB_NAME = "models.db"
+BLOB_API = "https://blob.vercel-storage.com"
 TOKEN = os.environ.get("BLOB_READ_WRITE_TOKEN")
-BLOB_API = "https://vercel-storage.com"
+REFRESH_SECONDS = 60
 
-def download_db():
-    if os.path.exists(TMP_DB_PATH): return
+TMP_RAW.mkdir(parents=True, exist_ok=True)
+
+
+def blob_headers(extra=None):
+    h = {"Authorization": f"Bearer {TOKEN}", "x-api-version": "7"}
+    if extra:
+        h.update(extra)
+    return h
+
+
+def download_from_blob():
+    """Pull latest DB from Blob into /tmp. Returns True on success."""
+    if not TOKEN:
+        return False
     try:
-        headers = {"Authorization": f"Bearer {TOKEN}"}
-        # List blobs matching the filename prefix
-        r = requests.get(f"{BLOB_API}?prefix={BLOB_FILENAME}", headers=headers)
-        blobs = r.json().get("blobs", [])
-        if blobs:
-            # Download the file content using its unique public URL
-            blob_url = blobs[0]["url"]
-            with open(TMP_DB_PATH, "wb") as f:
-                f.write(requests.get(blob_url).content)
+        r = requests.get(BLOB_API, params={"prefix": BLOB_NAME, "limit": 5},
+                         headers=blob_headers(), timeout=10)
+        r.raise_for_status()
+        blobs = [b for b in r.json().get("blobs", []) if b.get("pathname") == BLOB_NAME]
+        if not blobs:
+            return False
+        url = blobs[0].get("downloadUrl") or blobs[0]["url"]
+        d = requests.get(url, timeout=20)
+        d.raise_for_status()
+        tmp = TMP_DB.with_suffix(".dl")
+        tmp.write_bytes(d.content)
+        os.replace(tmp, TMP_DB)
+        return True
     except Exception as e:
-        print(f"Download error: {e}")
+        print(f"Blob download failed: {e}", file=sys.stderr)
+        return False
 
-def upload_db():
-    if not os.path.exists(TMP_DB_PATH): return
-    try:
-        with open(TMP_DB_PATH, "rb") as f:
-            binary_data = f.read()
 
-        # Vercel Blob API expects raw body data instead of multipart/form-data
-        headers = {
-            "Authorization": f"Bearer {TOKEN}",
-            "x-api-version": "1",
-            "X-Blob-Store-Timeout": "30"
-        }
-        
-        # Target the specific destination path on Vercel Blob
-        upload_url = f"{BLOB_API}/{BLOB_FILENAME}"
-        
+def upload_to_blob():
+    if not TOKEN:
+        return
+    with open(TMP_DB, "rb") as f:
         r = requests.put(
-            upload_url,
-            headers=headers,
-            data=binary_data,
-            timeout=30
+            f"{BLOB_API}/{BLOB_NAME}",
+            headers=blob_headers({
+                "x-add-random-suffix": "0",
+                "x-allow-overwrite": "1",
+                "x-content-type": "application/x-sqlite3",
+                "x-cache-control-max-age": "60",
+            }),
+            data=f, timeout=60,
         )
-        if r.status_code not in:
-            print(f"Upload failed status code: {r.status_code}, response: {r.text}")
-    except Exception as e:
-        print(f"Upload error: {e}")
+    r.raise_for_status()
 
-# 3. APP SETUP (Pointing to /tmp to prevent Read-only errors)
+
+def ensure_db(force=False):
+    fresh = TMP_DB.exists() and (time.time() - TMP_DB.stat().st_mtime) < REFRESH_SECONDS
+    if fresh and not force:
+        return
+    if download_from_blob():
+        return
+    if not TMP_DB.exists() and BUNDLED_DB.exists():
+        shutil.copy(BUNDLED_DB, TMP_DB)
+
+
+# Get the DB BEFORE the App is built
+ensure_db(force=True)
+
+from aimodels.dashboard import App, Paths  # noqa: E402
+
 paths = Paths()
-paths.live_db = Path(TMP_DB_PATH)
-paths.sample_db = Path(TMP_DB_PATH)
-paths.raw = Path("/tmp/raw")
-
-# Ensure /tmp/raw exists so the ETL pipeline doesn't throw a FileNotFoundError
-paths.raw.mkdir(parents=True, exist_ok=True)
-
+paths.live_db = TMP_DB
+paths.sample_db = TMP_DB
+if hasattr(paths, "raw"):
+    paths.raw = TMP_RAW
 app_instance = App(paths)
 
-# 4. ROUTER
+
+def respond(start_response, status, body, ctype="application/json"):
+    if isinstance(body, (dict, list)):
+        body = json.dumps(body, default=str)
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    start_response(status, [("Content-Type", ctype), ("Content-Length", str(len(body)))])
+    return [body]
+
+
 def app(environ, start_response):
     path = environ.get("PATH_INFO", "/")
     method = environ.get("REQUEST_METHOD", "GET")
-    
-    download_db()
 
-    if path.startswith("/api/"):
-        if method == "GET":
-            if path == "/api/status": data = app_instance.status()
-            elif path == "/api/models": data = app_instance.models("live")
-            elif path == "/api/quality": data = app_instance.quality("live")
-            elif path == "/api/report": data = app_instance.report("live")
-            else:
-                start_response("404 Not Found", [("Content-Type", "text/plain")])
-                return [b"API Not Found"]
-
-            if data is None:
-                start_response("404 Not Found", [("Content-Type", "application/json")])
-                return [b'{"error": "no data yet"}']
-
-            res = json.dumps(data, default=str).encode("utf-8")
-            start_response("200 OK", [("Content-Type", "application/json"), ("Content-Length", str(len(res)))])
-            return [res]
-
-        elif method == "POST":
-            if path == "/api/run":
-                try:
-                    from aimodels.pipeline import run_etl
-                    
-                    # Ensure directories exist right before running the pipeline 
-                    Path("/tmp/raw").mkdir(parents=True, exist_ok=True)
-                    
-                    summary = run_etl(
-                        offline=False, use_cache=False, skip_hf=False, 
-                        db_path=Path(TMP_DB_PATH),
-                        raw_dir=Path("/tmp/raw")
-                    )
-                    upload_db()
-                    
-                    res = json.dumps({"status": "done", "n_valid": summary.n_valid}).encode("utf-8")
-                    start_response("200 OK", [("Content-Type", "application/json")])
-                    return [res]
-                except Exception as e:
-                    start_response("500 Internal Error", [("Content-Type", "application/json")])
-                    return [json.dumps({"error": str(e)}).encode("utf-8")]
-
-            start_response("404 Not Found", [("Content-Type", "text/plain")])
-            return [b"Not Found"]
-
-    # SERVE FRONTEND
-    web_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src", "aimodels", "web"))
-    if path == "/" or path == "/index.html":
-        filepath = os.path.join(web_dir, "index.html")
-        if os.path.exists(filepath):
-            with open(filepath, "r", encoding="utf-8") as f:
-                html = f.read().replace("__TOKEN__", app_instance.token)
-            res = html.encode("utf-8")
-            start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(res)))])
-            return [res]
-
-    if path.startswith("/static/"):
-        filename = path.replace("/static/", "")
-        filepath = os.path.join(web_dir, filename)
-        if os.path.exists(filepath) and os.path.isfile(filepath):
-            with open(filepath, "rb") as f: content = f.read()
-            ctype = "text/css" if filename.endswith(".css") else "application/javascript" if filename.endswith(".js") else "application/octet-stream"
-            start_response("200 OK", [("Content-Type", ctype), ("Content-Length", str(len(content)))])
-            return [content]
-
-    start_response("404 Not Found", [("Content-Type", "text/plain")])
-    return [b"Not Found"]
-
-# 5. VERCEL ENTRYPOINT EXPORT
-# This assignment makes the application visible to Vercel's runtime routing engine.
-handler = app
+    try:
+        if path.startswith("/api/"):
+            ensure_db()
+            if method == "GET":
+                routes = {
+                    "/api/status": lambda: app_instance.status(),
+                    "/api/models": lambda: app_instance.models("live"),
+                    "/api/quality": lambda: app_instance.quality("live"),
+                    "/api/report": lambda: app_instance.report("live"),
+                }
+                if path not in routes:
+                    return respond(start_response, "404 Not Found", {"error": "not found"})
+                data = routes[path]()
+                if data is
