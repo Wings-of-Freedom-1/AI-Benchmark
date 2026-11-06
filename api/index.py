@@ -12,13 +12,19 @@ BUNDLED_DB = ROOT / "data" / "models.db"
 BLOB_NAME = "models.db"
 BLOB_API = "https://blob.vercel-storage.com"
 TOKEN = os.environ.get("BLOB_READ_WRITE_TOKEN")
+BLOB_ACCESS = os.environ.get("BLOB_ACCESS", "public")
+BLOB_API_VERSION = os.environ.get("BLOB_API_VERSION", "7")
 REFRESH_SECONDS = 60
 
 TMP_RAW.mkdir(parents=True, exist_ok=True)
 
 
 def blob_headers(extra=None):
-    h = {"Authorization": f"Bearer {TOKEN}", "x-api-version": "7"}
+    h = {
+        "Authorization": f"Bearer {TOKEN}",
+        "x-api-version": BLOB_API_VERSION,
+        "x-vercel-blob-access": BLOB_ACCESS,
+    }
     if extra:
         h.update(extra)
     return h
@@ -31,13 +37,18 @@ def download_from_blob():
     try:
         r = requests.get(BLOB_API, params={"prefix": BLOB_NAME, "limit": 5},
                          headers=blob_headers(), timeout=10)
-        r.raise_for_status()
+        if not r.ok:
+            print(f"Blob list failed {r.status_code}: {r.text}", file=sys.stderr)
+            return False
         blobs = [b for b in r.json().get("blobs", []) if b.get("pathname") == BLOB_NAME]
         if not blobs:
             return False
         url = blobs[0].get("downloadUrl") or blobs[0]["url"]
-        d = requests.get(url, timeout=20)
-        d.raise_for_status()
+        # Auth header is needed for private stores and harmless for public ones
+        d = requests.get(url, headers={"Authorization": f"Bearer {TOKEN}"}, timeout=20)
+        if not d.ok:
+            print(f"Blob download failed {d.status_code}: {d.text[:300]}", file=sys.stderr)
+            return False
         tmp = TMP_DB.with_suffix(".dl")
         tmp.write_bytes(d.content)
         os.replace(tmp, TMP_DB)
@@ -48,11 +59,13 @@ def download_from_blob():
 
 
 def upload_to_blob():
+    """Upload /tmp DB to Blob. Returns None on success, or an error string."""
     if not TOKEN:
-        return
+        return "BLOB_READ_WRITE_TOKEN is not set"
     with open(TMP_DB, "rb") as f:
         r = requests.put(
-            f"{BLOB_API}/{BLOB_NAME}",
+            BLOB_API,
+            params={"pathname": BLOB_NAME},
             headers=blob_headers({
                 "x-add-random-suffix": "0",
                 "x-allow-overwrite": "1",
@@ -61,7 +74,9 @@ def upload_to_blob():
             }),
             data=f, timeout=60,
         )
-    r.raise_for_status()
+    if not r.ok:
+        return f"{r.status_code}: {r.text[:500]}"
+    return None
 
 
 def ensure_db(force=False):
@@ -131,9 +146,13 @@ def application(environ, start_response):
                 from aimodels.pipeline import run_etl
                 summary = run_etl(offline=False, use_cache=False, skip_hf=False,
                                   db_path=TMP_DB, raw_dir=TMP_RAW)
-                upload_to_blob()
-                return respond(start_response, "200 OK",
-                               {"status": "done", "n_valid": getattr(summary, "n_valid", None)})
+                upload_error = upload_to_blob()
+                return respond(start_response, "200 OK", {
+                    "status": "done",
+                    "n_valid": getattr(summary, "n_valid", None),
+                    "saved_to_blob": upload_error is None,
+                    "upload_error": upload_error,
+                })
 
             return respond(start_response, "404 Not Found", {"error": "not found"})
 
