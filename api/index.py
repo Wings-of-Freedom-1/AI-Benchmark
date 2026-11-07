@@ -1,96 +1,206 @@
-"""Vercel adapter for the AI Benchmark dashboard.
+"""FastAPI adapter for Vercel.
 
-The local dashboard uses an in-memory background-thread job registry. That model
-cannot be shared reliably between independent Vercel Function invocations.
-This adapter therefore runs each job inside POST /api/run, captures the same
-Job object/log format used locally, and stores the resulting state snapshot in
-Vercel Blob. The existing frontend can keep polling /api/jobs/{id} unchanged.
+Reads from Turso (libSQL over HTTPS). Does NOT run ETL — run it locally or via
+GitHub Actions, then sync to Turso with scripts/migrate_to_turso.py.
 """
 
-from __future__ import annotations
-
-import base64
-import hashlib
-import json
-import mimetypes
 import os
-import secrets
-import shutil
-import sys
-import threading
 import time
-import traceback
-import uuid
-import zipfile
-from datetime import datetime, timezone
-from http.cookies import SimpleCookie
 from pathlib import Path
-from urllib.parse import parse_qs, quote
 
-import requests
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import turso_serverless
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-# ---------------------------------------------------------------------------
-# Paths and Vercel Blob settings
-# ---------------------------------------------------------------------------
-
-ROOT = Path(__file__).resolve().parent.parent
-SRC_DIR = ROOT / "src"
-WEB_DIR = SRC_DIR / "aimodels" / "web"
-BUNDLED_DATA_DIR = ROOT / "data"
-BUNDLED_REPORTS_DIR = ROOT / "reports"
-
-TMP_ROOT = Path("/tmp/ai-benchmark")
-DATA_DIR = TMP_ROOT / "data"
-LIVE_DB = DATA_DIR / "models.db"
-SAMPLE_DB = DATA_DIR / "sample.db"
-RAW_DIR = DATA_DIR / "raw"
-MANUAL_HF_FILE = DATA_DIR / "manual_hf_ids.csv"
-REPORTS_DIR = TMP_ROOT / "reports"
-STATE_FILE = TMP_ROOT / "state.json"
-
-BLOB_API = "https://blob.vercel-storage.com"
-BLOB_TOKEN = os.environ.get("BLOB_READ_WRITE_TOKEN", "").strip()
-BLOB_ACCESS = os.environ.get("BLOB_ACCESS", "public").strip().lower()
-BLOB_API_VERSION = os.environ.get("BLOB_API_VERSION", "7").strip()
-STATE_PREFIX = "ai-benchmark-state/"
-MAX_JOBS = 20
-MAX_BODY_BYTES = 1_000_000
-COOKIE_NAME = "aimodels_session_keys"
-COOKIE_MAX_AGE = 7 * 24 * 60 * 60
+WEB_DIR = Path(__file__).resolve().parents[1] / "src" / "aimodels" / "web"
+REPORTS_DIR = Path(__file__).resolve().parents[1] / "reports"
+TOKEN = os.environ.get("DASHBOARD_TOKEN", "")
 ALLOWED_STATIC = {"app.css", "app.js", "charts.js"}
+SQL_ROW_LIMIT = 1000
 
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-
-# Capture deployment-level keys once. Session keys are layered on top for a
-# single request and never written to the Blob snapshot.
-DEPLOYMENT_KEYS = {
-    "AA_API_KEY": os.environ.get("AA_API_KEY"),
-    "HF_TOKEN": os.environ.get("HF_TOKEN"),
-}
-
-_REQUEST_LOCK = threading.RLock()
-_STATE_META: dict = {"jobs": {}, "latest_job_id": None}
-_STATE_READY = False
-_STATE_LOADED_AT = 0.0
-STATE_CACHE_SECONDS = 15
+app = FastAPI()
 
 
-# ---------------------------------------------------------------------------
-# Helpers: responses, request bodies, and encrypted per-browser API-key cookie
-# ---------------------------------------------------------------------------
+def db():
+    url = os.environ.get("TURSO_DATABASE_URL")
+    token = os.environ.get("TURSO_AUTH_TOKEN")
+    if not url or not token:
+        raise HTTPException(500, "TURSO_DATABASE_URL / TURSO_AUTH_TOKEN not set")
+    return turso_serverless.connect(url, auth_token=token)
 
 
-def respond(start_response, status: str, body, content_type: str = "application/json",
-            extra_headers: list[tuple[str, str]] | None = None):
-    if isinstance(body, (dict, list)):
-        body = json.dumps(body, ensure_ascii=False, default=str, allow_nan=False)
-    if isinstance(body, str):
-        body = body.encode("utf-8")
+def rows_of(cursor) -> list[dict]:
+    cols = [d[0] for d in (cursor.description or [])]
+    return [dict(zip(cols, r)) for r in cursor.fetchall()]
 
-    headers = [
-        ("Content-Type", content_type),
-        ("Content-Length", str(len(body))),
-        ("Cache-Control", "no-store, max-age=0"),
-        ("X-Content-Type-Options", "nosniff"),
+
+# ---------- HTML & static ----------
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    return HTMLResponse(html.replace("__TOKEN__", TOKEN))
+
+
+@app.get("/static/{name}")
+def static_file(name: str):
+    if name not in ALLOWED_STATIC:
+        raise HTTPException(404, "not found")
+    p = WEB_DIR / name
+    if not p.exists():
+        raise HTTPException(404, "not found")
+    media_type = "application/javascript" if name.endswith(".js") else "text/css"
+    return Response(p.read_bytes(), media_type=media_type)
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return Response(b"", media_type="image/x-icon", status_code=204)
+
+
+# ---------- read API ----------
+
+@app.get("/api/status")
+def status():
+    conn = db()
+    try:
+        n = conn.execute("SELECT COUNT(*) FROM models").fetchone()[0]
+        last = conn.execute(
+            "SELECT run_id, finished_at, source, n_valid, n_rejected "
+            "FROM pipeline_runs ORDER BY run_id DESC LIMIT 1"
+        ).fetchone()
+        return {
+            "datasets": {
+                "live": {
+                    "exists": True, "models": n,
+                    "last_run": {"run_id": last[0], "finished_at": last[1], "source": last[2],
+                                 "n_valid": last[3], "n_rejected": last[4], "stats": {}} if last else None,
+                    "has_report": (REPORTS_DIR / "eda_summary.md").exists(),
+                },
+                "sample": {"exists": False, "models": 0, "last_run": None, "has_report": False},
+            },
+            "keys": {"aa": False, "hf": False},
+            "cached_raw": [], "job": None,
+            "defaults": {"fuzzy_threshold": 0.93, "max_reject_fraction": 0.25},
+            "attribution": "Data: Artificial Analysis (artificialanalysis.ai), OpenRouter, Hugging Face Hub",
+            "stages": ["extract", "transform", "validate", "load", "eda"],
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/api/models")
+def models():
+    conn = db()
+    try:
+        return {"dataset": "live", "run": None,
+                "models": rows_of(conn.execute("SELECT * FROM models ORDER BY name"))}
+    finally:
+        conn.close()
+
+
+@app.get("/api/quality")
+def quality():
+    conn = db()
+    try:
+        return {
+            "rejects": rows_of(conn.execute(
+                "SELECT model_key, name, errors FROM rejects "
+                "WHERE run_id = (SELECT MAX(run_id) FROM pipeline_runs)")),
+            "runs": rows_of(conn.execute(
+                "SELECT run_id, finished_at, source, n_aa, n_openrouter, n_hf, n_valid, n_rejected "
+                "FROM pipeline_runs ORDER BY run_id DESC LIMIT 20")),
+            "hf_status": rows_of(conn.execute(
+                "SELECT status, COUNT(*) AS n FROM raw_huggingface GROUP BY status")),
+            "snapshots": rows_of(conn.execute(
+                "SELECT snapshot_date AS date, COUNT(*) AS n, "
+                "AVG(intelligence_index) AS avg_score, AVG(price_blended_usd_per_m) AS avg_price "
+                "FROM model_snapshots GROUP BY snapshot_date ORDER BY 1")),
+            "unmatched": rows_of(conn.execute(
+                "SELECT name, name_key FROM models "
+                "WHERE match_method = 'none' AND hf_id IS NULL ORDER BY name LIMIT 300")),
+            "manual_hf": [],
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/api/report")
+def report():
+    md = REPORTS_DIR / "eda_summary.md"
+    fig_dir = REPORTS_DIR / "figures"
+    figs = sorted(fig_dir.glob("*.png")) if fig_dir.exists() else []
+    return {
+        "exists": md.exists(),
+        "markdown": md.read_text(encoding="utf-8") if md.exists() else "",
+        "mtime": md.stat().st_mtime if md.exists() else None,
+        "figures": [{"name": f.name, "url": f"/reports/figures/{f.name}?v={int(f.stat().st_mtime)}"}
+                    for f in figs],
+    }
+
+
+@app.get("/reports/figures/{name}")
+def figure(name: str):
+    p = REPORTS_DIR / "figures" / name
+    if not p.exists() or p.suffix != ".png":
+        raise HTTPException(404, "not found")
+    return Response(p.read_bytes(), media_type="image/png")
+
+
+# ---------- SQL console ----------
+
+@app.post("/api/sql")
+async def sql(request: Request):
+    body = await request.json()
+    query = str(body.get("query", "")).strip()
+    if not query.lower().startswith(("select", "with")):
+        raise HTTPException(400, "Only SELECT queries are allowed")
+    conn = db()
+    try:
+        started = time.time()
+        cur = conn.execute(query)
+        cols = [d[0] for d in (cur.description or [])]
+        data = cur.fetchall()
+        truncated = len(data) > SQL_ROW_LIMIT
+        data = [list(r) for r in data[:SQL_ROW_LIMIT]]
+        return {"columns": cols, "rows": data, "truncated": truncated,
+                "ms": round((time.time() - started) * 1000)}
+    finally:
+        conn.close()
+
+
+# ---------- ETL is disabled on Vercel ----------
+
+_ETL_MSG = ("ETL runs on GitHub Actions (see .github/workflows/sync.yml) "
+            "or locally, then syncs to Turso. It does not run inside Vercel.")
+
+@app.post("/api/run")
+async def run_disabled():
+    return JSONResponse(status_code=202, content={
+        "id": "vercel-disabled", "kind": "etl", "status": "error", "stage": "done",
+        "error": _ETL_MSG, "lines": [], "result": {}, "done_stages": [],
+        "params": {}, "started": 0, "finished": 0, "next": 0,
+    })
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: str):
+    return {"id": job_id, "kind": "etl", "status": "error", "stage": "done",
+            "error": _ETL_MSG, "lines": [], "result": {}, "done_stages": [],
+            "params": {}, "started": 0, "finished": 0, "next": 0}
+
+
+@app.post("/api/keys")
+async def keys_disabled():
+    return {"aa": False, "hf": False}
+
+
+@app.post("/api/diagnose")
+async def diagnose_disabled():
+    return {"results": [{"source": "Vercel", "ok": True,
+                         "message": "Read-only mode. ETL runs externally."}]}
+
+
+@app.post("/api/manual_hf")
+async def manual_hf_disabled():
+    raise HTTPException(503, "Manual Hugging Face edits are disabled on Vercel.")
