@@ -1,9 +1,2 @@
-requests>=2.31
-pandas>=2.2
-numpy>=1.26
-pydantic>=2.6
-matplotlib>=3.8
-python-dotenv>=1.0
-cryptography>=42.0
 fastapi>=0.110
 turso-serverless
