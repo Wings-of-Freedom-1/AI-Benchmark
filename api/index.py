@@ -66,6 +66,11 @@ def status():
         n = cur.fetchone()["n"]
         cur.execute("SELECT run_id, finished_at, source, n_valid, n_rejected FROM pipeline_runs ORDER BY run_id DESC LIMIT 1")
         last = cur.fetchone()
+        
+        # Read keys dynamically from Vercel environment variables
+        has_aa = bool(os.environ.get("AA_API_KEY"))
+        has_hf = bool(os.environ.get("HF_TOKEN"))
+
         return {
             "datasets": {
                 "live": {
@@ -73,9 +78,10 @@ def status():
                     "last_run": last if last else None,
                     "has_report": (REPORTS_DIR / "eda_summary.md").exists(),
                 },
+                # Demo mode is disabled on Vercel (no local sqlite file)
                 "sample": {"exists": False, "models": 0, "last_run": None, "has_report": False},
             },
-            "keys": {"aa": False, "hf": False},
+            "keys": {"aa": has_aa, "hf": has_hf},
             "cached_raw": [], "job": None,
             "defaults": {"fuzzy_threshold": 0.93, "max_reject_fraction": 0.25},
             "attribution": "Data: Artificial Analysis (artificialanalysis.ai), OpenRouter, Hugging Face Hub",
@@ -156,7 +162,7 @@ async def sql(request: Request):
 
 # ---------- ETL is disabled on Vercel ----------
 
-_ETL_MSG = "Vercel Deployment: ETL must be run locally or via a cron job. Data is synced to Supabase."
+_ETL_MSG = "Vercel Deployment: ETL is handled externally. Run `python -m aimodels all` locally to sync new data to Supabase."
 
 @app.post("/api/run")
 async def run_disabled():
@@ -182,7 +188,7 @@ def get_job(job_id: str):
 
 @app.post("/api/keys")
 async def keys_disabled():
-    return {"aa": False, "hf": False}
+    return {"aa": bool(os.environ.get("AA_API_KEY")), "hf": bool(os.environ.get("HF_TOKEN"))}
 
 @app.post("/api/diagnose")
 async def diagnose_disabled():
