@@ -1,6 +1,7 @@
-"""FastAPI adapter for Vercel with Supabase."""
+"""FastAPI adapter for Vercel with Supabase (Live) and SQLite (Demo)."""
 
 import os
+import sqlite3
 import time
 from pathlib import Path
 
@@ -9,26 +10,43 @@ import psycopg2.extras
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-# --- VERCEL REQUIREMENT ---
 app = FastAPI()
 
 WEB_DIR = Path(__file__).resolve().parents[1] / "src" / "aimodels" / "web"
 REPORTS_DIR = Path(__file__).resolve().parents[1] / "reports"
+SAMPLE_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "sample.db"
 TOKEN = os.environ.get("DASHBOARD_TOKEN", "vercel-token")
 ALLOWED_STATIC = {"app.css", "app.js", "charts.js"}
 SQL_ROW_LIMIT = 1000
 
-def db():
-    url = os.environ.get("SUPABASE_DB_URL")
-    if not url:
-        raise HTTPException(500, "SUPABASE_DB_URL is not set in Vercel Environment Variables")
-    conn = psycopg2.connect(url)
-    conn.autocommit = True
-    return conn
 
-def rows_of(cursor) -> list[dict]:
-    cols = [d[0] for d in (cursor.description or [])]
-    return [dict(zip(cols, r)) for r in cursor.fetchall()]
+def get_db(which: str):
+    """Returns a connection to either Supabase (live) or SQLite (sample)."""
+    if which == "sample":
+        if not SAMPLE_DB_PATH.exists():
+            raise HTTPException(404, "Demo database not found. Please run `python -m aimodels all --offline` and push sample.db.")
+        conn = sqlite3.connect(f"file:{SAMPLE_DB_PATH.as_posix()}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        return conn
+    else:
+        url = os.environ.get("SUPABASE_DB_URL")
+        if not url:
+            raise HTTPException(500, "SUPABASE_DB_URL is not set in Vercel Environment Variables")
+        conn = psycopg2.connect(url)
+        conn.autocommit = True
+        return conn
+
+
+def q(conn, sql: str) -> list[dict]:
+    """Helper to execute a query and return a list of dictionaries for both DBs."""
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) if not isinstance(conn, sqlite3.Connection) else conn.cursor()
+    cur.execute(sql)
+    if isinstance(conn, sqlite3.Connection):
+        cols = [d[0] for d in (cur.description or [])]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+    else:
+        return [dict(r) for r in cur.fetchall()]
+
 
 # ---------- HTML & static ----------
 
@@ -59,82 +77,76 @@ def favicon():
 
 @app.get("/api/status")
 def status():
-    conn = db()
-    try:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT COUNT(*) AS n FROM models")
-        n = cur.fetchone()["n"]
-        cur.execute("SELECT run_id, finished_at, source, n_valid, n_rejected FROM pipeline_runs ORDER BY run_id DESC LIMIT 1")
-        last = cur.fetchone()
-        
-        # Read keys dynamically from Vercel environment variables
-        has_aa = bool(os.environ.get("AA_API_KEY"))
-        has_hf = bool(os.environ.get("HF_TOKEN"))
+    datasets = {}
+    for which in ("live", "sample"):
+        try:
+            conn = get_db(which)
+            try:
+                n = q(conn, "SELECT COUNT(*) AS n FROM models")[0]["n"]
+                last = q(conn, "SELECT run_id, finished_at, source, n_valid, n_rejected FROM pipeline_runs ORDER BY run_id DESC LIMIT 1")
+                report_dir = REPORTS_DIR / "sample" if which == "sample" else REPORTS_DIR
+                datasets[which] = {
+                    "exists": True, "models": n, "last_run": last[0] if last else None,
+                    "has_report": (report_dir / "eda_summary.md").exists(),
+                }
+            finally:
+                conn.close()
+        except Exception:
+            datasets[which] = {"exists": False, "models": 0, "last_run": None, "has_report": False}
 
-        return {
-            "datasets": {
-                "live": {
-                    "exists": True, "models": n,
-                    "last_run": last if last else None,
-                    "has_report": (REPORTS_DIR / "eda_summary.md").exists(),
-                },
-                # Demo mode is disabled on Vercel (no local sqlite file)
-                "sample": {"exists": False, "models": 0, "last_run": None, "has_report": False},
-            },
-            "keys": {"aa": has_aa, "hf": has_hf},
-            "cached_raw": [], "job": None,
-            "defaults": {"fuzzy_threshold": 0.93, "max_reject_fraction": 0.25},
-            "attribution": "Data: Artificial Analysis (artificialanalysis.ai), OpenRouter, Hugging Face Hub",
-            "stages": ["extract", "transform", "validate", "load", "eda"],
-        }
-    finally:
-        conn.close()
+    return {
+        "datasets": datasets,
+        "keys": {"aa": bool(os.environ.get("AA_API_KEY")), "hf": bool(os.environ.get("HF_TOKEN"))},
+        "cached_raw": [], "job": None,
+        "defaults": {"fuzzy_threshold": 0.93, "max_reject_fraction": 0.25},
+        "attribution": "Data: Artificial Analysis (artificialanalysis.ai), OpenRouter, Hugging Face Hub",
+        "stages": ["extract", "transform", "validate", "load", "eda"],
+    }
 
 @app.get("/api/models")
-def models():
-    conn = db()
+def models(db: str = "sample"):
+    conn = get_db(db)
     try:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM models ORDER BY name")
-        return {"dataset": "live", "run": None, "models": [dict(r) for r in cur.fetchall()]}
+        return {"dataset": db, "run": None, "models": q(conn, "SELECT * FROM models ORDER BY name")}
     finally:
         conn.close()
 
 @app.get("/api/quality")
-def quality():
-    conn = db()
+def quality(db: str = "sample"):
+    conn = get_db(db)
     try:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        def q(sql):
-            cur.execute(sql)
-            return [dict(r) for r in cur.fetchall()]
-
         return {
-            "rejects": q("SELECT model_key, name, errors FROM rejects WHERE run_id = (SELECT MAX(run_id) FROM pipeline_runs)"),
-            "runs": q("SELECT run_id, finished_at, source, n_aa, n_openrouter, n_hf, n_valid, n_rejected FROM pipeline_runs ORDER BY run_id DESC LIMIT 20"),
-            "hf_status": q("SELECT status, COUNT(*) AS n FROM raw_huggingface GROUP BY status"),
-            "snapshots": q("SELECT snapshot_date AS date, COUNT(*) AS n, AVG(intelligence_index) AS avg_score, AVG(price_blended_usd_per_m) AS avg_price FROM model_snapshots GROUP BY snapshot_date ORDER BY 1"),
-            "unmatched": q("SELECT name, name_key FROM models WHERE match_method = 'none' AND hf_id IS NULL ORDER BY name LIMIT 300"),
+            "rejects": q(conn, "SELECT model_key, name, errors FROM rejects WHERE run_id = (SELECT MAX(run_id) FROM pipeline_runs)"),
+            "runs": q(conn, "SELECT run_id, finished_at, source, n_aa, n_openrouter, n_hf, n_valid, n_rejected FROM pipeline_runs ORDER BY run_id DESC LIMIT 20"),
+            "hf_status": q(conn, "SELECT status, COUNT(*) AS n FROM raw_huggingface GROUP BY status"),
+            "snapshots": q(conn, "SELECT snapshot_date AS date, COUNT(*) AS n, AVG(intelligence_index) AS avg_score, AVG(price_blended_usd_per_m) AS avg_price FROM model_snapshots GROUP BY snapshot_date ORDER BY 1"),
+            "unmatched": q(conn, "SELECT name, name_key FROM models WHERE match_method = 'none' AND hf_id IS NULL ORDER BY name LIMIT 300"),
             "manual_hf": [],
         }
     finally:
         conn.close()
 
 @app.get("/api/report")
-def report():
-    md = REPORTS_DIR / "eda_summary.md"
-    fig_dir = REPORTS_DIR / "figures"
+def report(db: str = "sample"):
+    report_dir = REPORTS_DIR / "sample" if db == "sample" else REPORTS_DIR
+    md = report_dir / "eda_summary.md"
+    fig_dir = report_dir / "figures"
     figs = sorted(fig_dir.glob("*.png")) if fig_dir.exists() else []
+    
+    prefix = "/reports/sample/figures/" if db == "sample" else "/reports/figures/"
     return {
         "exists": md.exists(),
         "markdown": md.read_text(encoding="utf-8") if md.exists() else "",
         "mtime": md.stat().st_mtime if md.exists() else None,
-        "figures": [{"name": f.name, "url": f"/reports/figures/{f.name}?v={int(f.stat().st_mtime)}"} for f in figs],
+        "figures": [{"name": f.name, "url": f"{prefix}{f.name}?v={int(f.stat().st_mtime)}"} for f in figs],
     }
 
 @app.get("/reports/figures/{name}")
-def figure(name: str):
-    p = REPORTS_DIR / "figures" / name
+@app.get("/reports/sample/figures/{name}")
+def figure(name: str, request: Request):
+    is_sample = "/sample/" in request.url.path
+    fig_dir = (REPORTS_DIR / "sample" / "figures") if is_sample else (REPORTS_DIR / "figures")
+    p = fig_dir / name
     if not p.exists() or p.suffix != ".png":
         raise HTTPException(404, "not found")
     return Response(p.read_bytes(), media_type="image/png")
@@ -144,10 +156,11 @@ def figure(name: str):
 @app.post("/api/sql")
 async def sql(request: Request):
     body = await request.json()
+    db_name = str(body.get("dataset", "sample"))
     query = str(body.get("query", "")).strip()
     if not query.lower().startswith(("select", "with")):
         raise HTTPException(400, "Only SELECT queries are allowed")
-    conn = db()
+    conn = get_db(db_name)
     try:
         started = time.time()
         cur = conn.cursor()
@@ -162,7 +175,7 @@ async def sql(request: Request):
 
 # ---------- ETL is disabled on Vercel ----------
 
-_ETL_MSG = "Vercel Deployment: ETL is handled externally. Run `python -m aimodels all` locally to sync new data to Supabase."
+_ETL_MSG = "Vercel Deployment: ETL is handled externally. Run `python -m aimodels all` locally to sync new data."
 
 @app.post("/api/run")
 async def run_disabled():
