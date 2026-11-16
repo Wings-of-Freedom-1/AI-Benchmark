@@ -210,11 +210,19 @@ async def run_disabled(request: Request):
 
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str):
+    # The frontend reads the final count from this polling endpoint.
+    try:
+        conn = get_db("live")
+        n = q(conn, "SELECT COUNT(*) AS n FROM models")[0]["n"]
+        conn.close()
+    except Exception:
+        n = 0
+
     return {
         "id": job_id, "kind": "etl", "status": "done", "stage": "done",
         "error": None, 
         "lines": [{"t": time.strftime("%H:%M:%S"), "lvl": "INFO", "msg": _ETL_MSG}],
-        "result": {"n_valid": 0, "n_rejected": 0}, 
+        "result": {"n_valid": n, "n_rejected": 0}, 
         "done_stages": ["extract", "transform", "validate", "load", "eda"],
         "params": {}, "started": time.time(), "finished": time.time(), "next": 1,
     }
