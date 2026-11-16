@@ -1,7 +1,6 @@
 # Which AI models give the best performance for their size, cost and speed?
 
-An ETL + EDA pipeline that joins three public data sources into one SQLite database
-and explores it.
+An ETL + EDA pipeline that joins three public data sources into a Supabase (PostgreSQL) database for the live deployment, or a local SQLite database for offline testing, and explores it via an interactive web dashboard.
 
 | Dimension | Source | What we take |
 |---|---|---|
@@ -39,7 +38,7 @@ frontier, tooltips, click to pin), **Leaderboard** (sortable, CSV export), **Com
 **Correlations**, **Trends**, **Data quality** (missingness, how names were matched, rejected rows, a form to map open models to
 Hugging Face repos by hand, run history), a read-only **SQL** console, the **Report** (all generated charts and the written summary) and the run **Log**.
 Drag knobs (Shift = fine, wheel and arrow keys work, double-click resets), save your favourite positions as **scenes**,
-and switch light/dark. The console only listens on your own computer.
+and switch light/dark.The dashboard can be run locally or deployed to Vercel. Live data is stored persistently in Supabase, while the offline Demo mode uses a bundled SQLite file.
 
 ## Quick start
 
@@ -51,6 +50,7 @@ make test                          # all tests run offline
 python -m aimodels all --offline   # -> reports/sample/eda_summary.md + figures/
 
 # 2) Real run
+export SUPABASE_DB_URL="postgresql://postgres.[PROJECT_ID]:[PASSWORD]@aws-0-[REGION].pooler.supabase.com:5432/postgres"
 export AA_API_KEY=...              # free key: artificialanalysis.ai -> Insights Platform
 export HF_TOKEN=...                # optional, raises the Hugging Face rate limit
 python -m aimodels all             # -> data/models.db, reports/eda_summary.md + figures/
@@ -129,13 +129,8 @@ cheaper and better) rather than a single ranking, because the right trade-off de
 
 ## Caveats you should know about
 
-- **The live API calls have not been exercised.** The extractors were written against the
-  documented response shapes, but this project was built in a sandbox without access to those
-  APIs, so everything was tested with a synthetic stand-in (`sample_data.py`, clearly labelled).
-  Expect a first live run to need small fixes. Two places most likely to need attention:
-  the Artificial Analysis path (two documented variants are tried in order; override with
-  `AA_URL`) and the field names in `AA_FIELD_PATHS` (`clean.py`). The pipeline warns loudly if
-  a key column comes back entirely empty.
+- API Limits: The free tier of the Artificial Analysis API may return missing values for individual benchmarks (like MMLU or GPQA). As a result, features like the
+  "Correlations" tab may be empty in Live mode. The synthetic Demo data includes all benchmarks so you can see how those charts look.
 - The synthetic data exists to prove the plumbing. Its findings say nothing about real models.
 - "Open weights" is inferred from a Hugging Face repo id; open models OpenRouter does not list count
   as closed unless added to the manual CSV.
@@ -146,17 +141,17 @@ cheaper and better) rather than a single ranking, because the right trade-off de
 ## Layout
 
 ```
+api/index.py   FastAPI adapter for Vercel (routes traffic, handles Supabase/SQLite switching)
 src/aimodels/  config.py extract.py normalize.py clean.py schemas.py load.py pipeline.py eda.py sample_data.py __main__.py
 tests/         name matching, merge rules, validation, SQLite constraints, end-to-end ETL → EDA
-data/          manual_hf_ids.csv, raw/ (downloads), models.db (live), sample.db (synthetic)
+data/          manual_hf_ids.csv, raw/ (downloads), sample.db (synthetic for Demo mode)
 reports/       eda_summary.md + figures/ (live), sample/ (synthetic demo output)
-notebooks/     eda.ipynb - the same analysis, step by step
-src/aimodels/web/  the dashboard page (index.html, app.js, charts.js, app.css); dashboard.py is its local server
+src/aimodels/web/  the dashboard page (index.html, app.js, charts.js, app.css, favicon.svg)
+vercel.json    Vercel deployment configuration
 ```
 
 ## Troubleshooting Live mode
 
-1. Open **ADV** on the Pipeline panel, paste your Artificial Analysis key and press **Test connections**. It checks the key and all three websites and says which one fails and why (wrong key, plan without access, daily limit, proxy/VPN/firewall, certificate).
-2. The red "DEMO DATA" badge only appears while the **Demo** dataset is selected. In **Live** mode with nothing fetched yet, the badge says so instead.
-3. Pressing the power button now stores a pasted key automatically; "Use keys" is optional.
-4. The full error text is always in the **Log** tab.
+1. Vercel Deployment: The live dashboard on Vercel is read-only. To update the live data, you must run python -m aimodels all locally (or via GitHub Codespaces) so it pushes the new data to Supabase.
+2. Live vs Demo: Clicking the power button in Vercel Live mode will show a friendly "Done" message, but it will not fetch new data. Use the Demo button to explore synthetic data, or run the CLI locally to fetch real data.
+3. Favicon: The custom icon is embedded directly in the HTML to bypass Vercel routing and aggressive browser caching.
