@@ -277,3 +277,10 @@ async def diagnose_disabled():
 @app.post("/api/manual_hf")
 async def manual_hf_disabled():
     raise HTTPException(503, "Manual Hugging Face edits are disabled on Vercel.")
+    
+@app.get("/favicon.ico")
+def favicon_ico():
+    p = WEB_DIR / "favicon.svg"
+    if p.exists():
+        return Response(p.read_bytes(), media_type="image/svg+xml")
+    return Response(b"", media_type="image/x-icon", status_code=204)
