@@ -91,6 +91,15 @@ def fix_pg_query(query: str) -> str:
 
 # ---------- HTML & static ----------
 
+@app.get("/favicon.svg")
+@app.get("/favicon.ico")
+def serve_favicon():
+    # Force the correct MIME type so the browser renders it as an image
+    p = WEB_DIR / "favicon.svg"
+    if p.exists():
+        return Response(p.read_bytes(), media_type="image/svg+xml")
+    return Response(b"", media_type="image/x-icon", status_code=204)
+
 @app.get("/", response_class=HTMLResponse)
 @app.get("/api", response_class=HTMLResponse)
 @app.get("/api/", response_class=HTMLResponse)
