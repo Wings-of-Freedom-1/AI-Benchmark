@@ -142,9 +142,12 @@ def _label_points(ax, rows: pd.DataFrame, x: str, y: str, max_labels: int = 6) -
         px, py = ax.transData.transform((getattr(r, x), getattr(r, y)))
         if any(abs(px - qx) < 90 and abs(py - qy) < 14 for qx, qy in placed):
             continue
-                                ha="right" if near_right else "left", fontsize=7.5, color=INK2, zorder=5)
-
-
+        placed.append((px, py))
+        near_right = px > box.x0 + 0.72 * box.width  # flip the label to the left so it is not clipped
+        ax.annotate(_short(r.name, 26), (getattr(r, x), getattr(r, y)),
+                    xytext=(-6 if near_right else 6, -11), textcoords="offset points",
+                    ha="right" if near_right else "left", fontsize=7.5, color=INK2, zorder=5)
+        
 def _money(v, _=None) -> str:
     return f"${v:,.2f}" if v < 1 else f"${v:,.0f}" if v >= 10 else f"${v:g}"
 
