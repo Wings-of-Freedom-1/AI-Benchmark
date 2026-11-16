@@ -19,7 +19,7 @@ WEB_DIR = Path(__file__).resolve().parents[1] / "src" / "aimodels" / "web"
 REPORTS_DIR = Path(__file__).resolve().parents[1] / "reports"
 SAMPLE_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "sample.db"
 TOKEN = os.environ.get("DASHBOARD_TOKEN", "vercel-token")
-ALLOWED_STATIC = {"app.css", "app.js", "charts.js"}
+ALLOWED_STATIC = {"app.css", "app.js", "charts.js", "favicon.svg"}
 SQL_ROW_LIMIT = 1000
 
 
