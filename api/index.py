@@ -167,10 +167,15 @@ def figure(name: str, request: Request):
 @app.post("/api/sql")
 async def sql(request: Request):
     body = await request.json()
-    db_name = str(body.get("dataset", "sample"))
+    # FIX: Check body, then query params, then default to sample
+    db_name = str(body.get("dataset") or request.query_params.get("db") or "sample")
+    if db_name not in ("live", "sample"):
+        db_name = "sample"
+        
     query = str(body.get("query", "")).strip()
     if not query.lower().startswith(("select", "with")):
         raise HTTPException(400, "Only SELECT queries are allowed")
+        
     conn = get_db(db_name)
     try:
         started = time.time()
@@ -209,10 +214,9 @@ async def run_disabled(request: Request):
     })
 
 @app.get("/api/jobs/{job_id}")
-def get_job(job_id: str):
-    # The frontend reads the final count from this polling endpoint.
+def get_job(job_id: str, db: str = "sample"):
     try:
-        conn = get_db("live")
+        conn = get_db(db)
         n = q(conn, "SELECT COUNT(*) AS n FROM models")[0]["n"]
         conn.close()
     except Exception:
