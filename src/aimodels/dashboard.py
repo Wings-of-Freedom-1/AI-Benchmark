@@ -16,15 +16,10 @@ Design notes
 
 Supabase
 --------
-Set ``SUPABASE_DB_URL`` (e.g. in ``.env``) to a libpq connection string and the
-dashboard will read every dataset through psycopg2 instead of the local SQLite
-files. All API endpoints and payload shapes are unchanged — the frontend does
-not need to know. When ``SUPABASE_DB_URL`` is unset, behaviour is identical to
-before (SQLite files under ``data/``).
-
-Writes (ETL/EDA) still go through ``pipeline.run_etl`` / ``eda.run_eda``; those
-modules must accept ``db_path=None`` to indicate "use Supabase" — until they
-do, the ETL button will raise a clear error when Supabase mode is enabled.
+If ``SUPABASE_DB_URL`` is set, the *live* dataset is read from and written to
+Supabase (PostgreSQL) instead of the local SQLite file. Sample/demo mode always
+stays on local SQLite. Every API response shape is unchanged, so ``web/`` does
+not need any modification.
 """
 
 from __future__ import annotations
@@ -43,24 +38,31 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-from .config import ATTRIBUTION, DB_PATH, FUZZY_THRESHOLD, MANUAL_HF_PATH, MAX_REJECT_FRACTION, RAW_DIR, REPORTS_DIR, SAMPLE_DB_PATH
+from .config import (
+    ATTRIBUTION,
+    DB_PATH,
+    FUZZY_THRESHOLD,
+    MANUAL_HF_PATH,
+    MAX_REJECT_FRACTION,
+    RAW_DIR,
+    REPORTS_DIR,
+    SAMPLE_DB_PATH,
+    SUPABASE_DB_URL,
+)
 
 log = logging.getLogger("aimodels.dashboard")
 
-# --- Supabase wiring -------------------------------------------------------
-# Read once at import time; config.py already loads .env before this line.
-SUPABASE_DB_URL = os.environ.get("SUPABASE_DB_URL")
-
-try:  # psycopg2 is only needed when Supabase is actually configured
+try:
     import psycopg2
     import psycopg2.extras
-    _HAS_PSYCOPG2 = True
+    _HAS_PG = True
     _DB_ERRORS: tuple = (sqlite3.Error, psycopg2.Error)
-except ImportError:  # SQLite-only installs stay untouched
+except ImportError:  # sqlite-only installs keep working
     psycopg2 = None  # type: ignore[assignment]
-    _HAS_PSYCOPG2 = False
+    _HAS_PG = False
     _DB_ERRORS = (sqlite3.Error,)
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
@@ -72,14 +74,13 @@ ALLOWED_STATIC = {"app.css", "app.js", "charts.js"}
 
 
 class _PgReadConn:
-    """Adapter that makes a psycopg2 connection quack like sqlite3.
+    """Make a psycopg2 read-only connection quack like sqlite3.
 
-    Only ``execute()``, the cursor methods that ``execute()`` returns
-    (``fetchone`` / ``fetchall`` / iteration) and ``close()`` are used by the
-    read paths below. Rows come back as ``RealDictRow`` (a ``dict`` subclass),
-    so ``dict(row)`` and ``row["col"]`` keep working — but tuple-style
-    ``row[0]`` access does not, which is why ``status()`` uses ``["n"]`` on
-    the COUNT query.
+    Only ``execute()``, ``close()`` and cursor methods
+    (``fetchone`` / ``fetchmany`` / ``description`` / iteration) are used by the
+    read paths below. Rows are ``RealDictRow`` (a ``dict`` subclass), so
+    ``dict(row)`` and ``row["col"]`` keep working — ``row[0]`` does **not**,
+    which is why the COUNT query uses ``AS n`` and the column name.
     """
 
     def __init__(self, conn):
@@ -87,7 +88,10 @@ class _PgReadConn:
         self._cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     def execute(self, sql: str, params=None):
-        self._cursor.execute(sql, params)
+        if params:
+            self._cursor.execute(sql, params)
+        else:
+            self._cursor.execute(sql)
         return self._cursor
 
     def close(self) -> None:
@@ -213,9 +217,17 @@ class App:
         p = job.params
         try:
             dataset = p["dataset"]
-            # Supabase mode -> tell the pipeline "no local file; use Supabase".
-            # pipeline.run_etl / eda.run_eda must accept ``db_path=None`` for this.
-            db = None if SUPABASE_DB_URL else self.paths.db(dataset)
+            #  ``db`` is the location identifier passed into run_etl/run_eda:
+            #  * sample mode  -> explicit SQLite path
+            #  * live + Supabase configured -> None (means "use Supabase")
+            #  * live, no Supabase -> local SQLite path
+            if dataset == "sample":
+                db: Path | None = self.paths.sample_db
+            elif SUPABASE_DB_URL:
+                db = None
+            else:
+                db = self.paths.live_db
+
             if self.keys.get("AA_API_KEY"):
                 os.environ["AA_API_KEY"] = self.keys["AA_API_KEY"]
             if self.keys.get("HF_TOKEN"):
@@ -257,45 +269,26 @@ class App:
             logger.setLevel(previous_level)
 
     # ---- read-side helpers ---------------------------------------------
-    def _has_data(self, which: str) -> bool:
-        """True if the chosen dataset has *any* models (SQLite file or Supabase)."""
-        if SUPABASE_DB_URL:
-            try:
-                conn = self._connect_ro(which)
-                if conn is None:
-                    return False
-                try:
-                    return conn.execute("SELECT 1 FROM models LIMIT 1").fetchone() is not None
-                finally:
-                    conn.close()
-            except Exception:  # noqa: BLE001 - any failure = "no data yet"
-                return False
-        return self.paths.db(which).exists()
+    def _connect_ro(self, which: str) -> Any | None:
+        """Read-only connection for ``which`` ('live' or 'sample').
 
-    def _connect_ro(self, which: str):
-        """Read-only connection. Returns None when the dataset has no tables yet.
-
-        * Supabase mode: a psycopg2 connection wrapped in ``_PgReadConn`` (or
-          None if the ``models`` table has not been created yet).
-        * SQLite mode: a file-backed sqlite3 connection (or None if the file
-          does not exist), exactly as before.
+        * live + Supabase configured -> psycopg2 connection wrapped in ``_PgReadConn``
+          (returns ``None`` if the ``models`` table has not been created yet).
+        * everything else -> a file-backed sqlite3 connection
+          (returns ``None`` if the SQLite file does not exist).
         """
-        if SUPABASE_DB_URL:
-            if not _HAS_PSYCOPG2:
+        if which == "live" and SUPABASE_DB_URL:
+            if not _HAS_PG:
                 raise RuntimeError(
                     "SUPABASE_DB_URL is set but psycopg2 is not installed. "
-                    "Install it with `pip install psycopg2-binary`."
+                    "Install it with: pip install psycopg2-binary"
                 )
-            conn = psycopg2.connect(SUPABASE_DB_URL)
+            conn = psycopg2.connect(SUPABASE_DB_URL, options="-c default_transaction_read_only=on")
             conn.autocommit = True
-            with conn.cursor() as cur:
-                cur.execute("SET default_transaction_read_only = on")
             wrapper = _PgReadConn(conn)
             try:
-                # Probe the models table so callers get None instead of an error
-                # before the first ETL run.
                 wrapper.execute("SELECT 1 FROM models LIMIT 1").fetchone()
-            except Exception:  # noqa: BLE001 - table missing / permission denied
+            except _DB_ERRORS:
                 wrapper.close()
                 return None
             return wrapper
@@ -307,6 +300,13 @@ class App:
         conn.row_factory = sqlite3.Row
         return conn
 
+    def _has_data(self, which: str) -> bool:
+        conn = self._connect_ro(which)
+        if conn is None:
+            return False
+        conn.close()
+        return True
+
     def status(self) -> dict:
         datasets = {}
         for which in ("sample", "live"):
@@ -315,7 +315,6 @@ class App:
             if conn:
                 try:
                     info["exists"] = True
-                    # ``["n"]`` works on both sqlite3.Row and RealDictRow.
                     info["models"] = conn.execute("SELECT COUNT(*) AS n FROM models").fetchone()["n"]
                     row = conn.execute("SELECT * FROM pipeline_runs ORDER BY run_id DESC LIMIT 1").fetchone()
                     if row:
@@ -424,7 +423,7 @@ class App:
         }
 
     def run_sql(self, which: str, query: str) -> dict:
-        if SUPABASE_DB_URL:
+        if which == "live" and SUPABASE_DB_URL:
             return self._run_sql_pg(query)
 
         conn = self._connect_ro(which)
@@ -454,15 +453,15 @@ class App:
 
     def _run_sql_pg(self, query: str) -> dict:
         """Read-only SQL console against Supabase/PostgreSQL."""
-        if not _HAS_PSYCOPG2:
+        if not _HAS_PG:
             raise RuntimeError(
                 "SUPABASE_DB_URL is set but psycopg2 is not installed. "
-                "Install it with `pip install psycopg2-binary`."
+                "Install it with: pip install psycopg2-binary"
             )
         started = time.time()
         opts = (
+            "-c default_transaction_read_only=on "
             f"-c statement_timeout={int(SQL_TIME_LIMIT_S * 1000)}"
-            " -c default_transaction_read_only=on"
         )
         conn = psycopg2.connect(SUPABASE_DB_URL, options=opts)
         try:
