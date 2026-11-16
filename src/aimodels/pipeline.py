@@ -12,7 +12,15 @@ from pathlib import Path
 
 from . import extract
 from .clean import build_models
-from .config import DB_PATH, FUZZY_THRESHOLD, MANUAL_HF_PATH, MAX_REJECT_FRACTION, RAW_DIR, SAMPLE_DB_PATH
+from .config import (
+    DB_PATH,
+    FUZZY_THRESHOLD,
+    MANUAL_HF_PATH,
+    MAX_REJECT_FRACTION,
+    RAW_DIR,
+    SAMPLE_DB_PATH,
+    SUPABASE_DB_URL,
+)
 from .load import load_all
 from .sample_data import build_sample
 from .schemas import validate_models
@@ -30,7 +38,7 @@ MANUAL_HF_HEADER = [
 class RunSummary:
     run_id: int
     source: str
-    db_path: Path
+    db_path: Path | None  # None = Supabase
     n_valid: int
     n_rejected: int
     stats: dict
@@ -53,6 +61,24 @@ def save_manual_hf(mapping: dict[str, str], path: Path = MANUAL_HF_PATH) -> None
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _resolve_db_path(db_path: Path | None, offline: bool) -> Path | None:
+    """Decide where writes go.
+
+    Priority:
+    1. Explicit ``db_path`` — always honoured (caller wins).
+    2. ``offline=True`` — the synthetic SQLite file, even if Supabase is configured.
+    3. ``SUPABASE_DB_URL`` set — None, meaning "Supabase".
+    4. Otherwise — the live SQLite file.
+    """
+    if db_path is not None:
+        return db_path
+    if offline:
+        return SAMPLE_DB_PATH
+    if SUPABASE_DB_URL:
+        return None
+    return DB_PATH
+
+
 def run_etl(
     *,
     offline: bool = False,
@@ -65,10 +91,14 @@ def run_etl(
     max_reject_fraction: float | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> RunSummary:
-    """Run the whole ETL. ``on_stage`` is told when each stage begins (used by the dashboard)."""
+    """Run the whole ETL. ``on_stage`` is told when each stage begins (used by the dashboard).
+
+    ``db_path=None`` with ``SUPABASE_DB_URL`` set → writes go to Supabase.
+    Explicit ``db_path`` or ``offline=True`` → SQLite as before.
+    """
     stage = on_stage or (lambda _name: None)
     started = datetime.now(timezone.utc)
-    db_path = db_path or (SAMPLE_DB_PATH if offline else DB_PATH)
+    resolved_db = _resolve_db_path(db_path, offline)
     fuzzy = FUZZY_THRESHOLD if fuzzy_threshold is None else fuzzy_threshold
     tolerance = MAX_REJECT_FRACTION if max_reject_fraction is None else max_reject_fraction
     hf_lookup = None
@@ -113,5 +143,6 @@ def run_etl(
 
     # ---- Load --------------------------------------------------------------
     stage("load")
-    run_id = load_all(db_path, result, validation.valid, validation.rejects, source=source, started_at=started)
-    return RunSummary(run_id, source, db_path, len(validation.valid), len(validation.rejects), result.stats)
+    run_id = load_all(resolved_db, result, validation.valid, validation.rejects,
+                      source=source, started_at=started)
+    return RunSummary(run_id, source, resolved_db, len(validation.valid), len(validation.rejects), result.stats)
