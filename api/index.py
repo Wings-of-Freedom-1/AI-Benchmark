@@ -167,7 +167,6 @@ def figure(name: str, request: Request):
 @app.post("/api/sql")
 async def sql(request: Request):
     body = await request.json()
-    # FIX: Check body, then query params, then default to sample
     db_name = str(body.get("dataset") or request.query_params.get("db") or "sample")
     if db_name not in ("live", "sample"):
         db_name = "sample"
@@ -175,7 +174,14 @@ async def sql(request: Request):
     query = str(body.get("query", "")).strip()
     if not query.lower().startswith(("select", "with")):
         raise HTTPException(400, "Only SELECT queries are allowed")
-        
+
+    # FIX: PostgreSQL requires CAST for ROUND on floating point numbers.
+    if db_name == "live":
+        query = query.replace("ROUND(AVG(", "ROUND(CAST(AVG(")
+        query = query.replace("), 1)", ") AS NUMERIC), 1)")
+        query = query.replace("), 2)", ") AS NUMERIC), 2)")
+        query = query.replace("), 0)", ") AS NUMERIC), 0)")
+
     conn = get_db(db_name)
     try:
         started = time.time()
@@ -186,6 +192,9 @@ async def sql(request: Request):
         truncated = len(data) > SQL_ROW_LIMIT
         data = [[sanitize(v) for v in r] for r in data[:SQL_ROW_LIMIT]]
         return {"columns": cols, "rows": data, "truncated": truncated, "ms": round((time.time() - started) * 1000)}
+    except Exception as exc:
+        # Return the exact SQL error to the frontend so it doesn't just show a blank table
+        raise HTTPException(status_code=400, detail=str(exc))
     finally:
         conn.close()
 
