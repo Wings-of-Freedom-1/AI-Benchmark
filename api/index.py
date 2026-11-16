@@ -3,6 +3,7 @@
 import datetime
 import decimal
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -57,6 +58,28 @@ def q(conn, sql: str) -> list[dict]:
         return [dict(zip(cols, [sanitize(v) for v in r])) for r in cur.fetchall()]
     else:
         return [{k: sanitize(v) for k, v in dict(r).items()} for r in cur.fetchall()]
+
+
+def fix_pg_query(query: str) -> str:
+    """Translates SQLite syntax to PostgreSQL syntax so frontend queries don't break."""
+    # 1. Fix ROUND() requiring NUMERIC cast
+    query = re.sub(r'ROUND\((.*?),\s*(\d+)\)', r'ROUND(CAST(\1 AS NUMERIC), \2)', query, flags=re.IGNORECASE | re.DOTALL)
+    
+    # 2. Fix AVG() returning null (SQLite returns 0). Wraps in COALESCE.
+    query = re.sub(r'AVG\((.*?)\)', r'COALESCE(AVG(\1), 0)', query, flags=re.IGNORECASE)
+    
+    # 3. Fix sqlite_master for the Tables preset
+    if "sqlite_master" in query.lower():
+        query = re.sub(r'FROM\s+sqlite_master', 'FROM information_schema.tables', query, flags=re.IGNORECASE)
+        query = re.sub(r'\bname\b', 'table_name AS name', query, flags=re.IGNORECASE)
+        query = re.sub(r"type\s*=\s*'table'", "table_schema='public'", query, flags=re.IGNORECASE)
+        query = query.replace("table_name AS name AS name", "table_name AS name")
+        
+    # 4. Fix rowid (SQLite) -> ctid (Postgres)
+    if "rowid" in query.lower():
+        query = re.sub(r'\browid\b', 'ctid', query, flags=re.IGNORECASE)
+        
+    return query
 
 
 # ---------- HTML & static ----------
@@ -175,12 +198,9 @@ async def sql(request: Request):
     if not query.lower().startswith(("select", "with")):
         raise HTTPException(400, "Only SELECT queries are allowed")
 
-    # FIX: PostgreSQL requires CAST for ROUND on floating point numbers.
+    # Translate SQLite-specific syntax to Postgres syntax if needed
     if db_name == "live":
-        query = query.replace("ROUND(AVG(", "ROUND(CAST(AVG(")
-        query = query.replace("), 1)", ") AS NUMERIC), 1)")
-        query = query.replace("), 2)", ") AS NUMERIC), 2)")
-        query = query.replace("), 0)", ") AS NUMERIC), 0)")
+        query = fix_pg_query(query)
 
     conn = get_db(db_name)
     try:
@@ -193,7 +213,6 @@ async def sql(request: Request):
         data = [[sanitize(v) for v in r] for r in data[:SQL_ROW_LIMIT]]
         return {"columns": cols, "rows": data, "truncated": truncated, "ms": round((time.time() - started) * 1000)}
     except Exception as exc:
-        # Return the exact SQL error to the frontend so it doesn't just show a blank table
         raise HTTPException(status_code=400, detail=str(exc))
     finally:
         conn.close()
