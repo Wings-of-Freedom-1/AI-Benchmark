@@ -7,7 +7,7 @@ import logging
 import sys
 from pathlib import Path
 
-from .config import DB_PATH, REPORTS_DIR, SAMPLE_DB_PATH
+from .config import DB_PATH, REPORTS_DIR, SAMPLE_DB_PATH, SUPABASE_DB_URL
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -37,6 +37,20 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _resolve_db(args: argparse.Namespace) -> Path | None:
+    """Pick where the CLI reads and writes.
+
+    Priority: explicit ``--db`` > ``--offline`` > Supabase (if configured) > local.
+    """
+    if getattr(args, "db", None):
+        return args.db
+    if getattr(args, "offline", False):
+        return SAMPLE_DB_PATH
+    if SUPABASE_DB_URL:
+        return None  # Supabase
+    return DB_PATH
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.cmd in (None, "dashboard"):
@@ -50,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    db = args.db or (SAMPLE_DB_PATH if args.offline else DB_PATH)
+    db = _resolve_db(args)
 
     if args.cmd in ("etl", "all"):
         from .extract import ExtractError
@@ -62,7 +76,8 @@ def main(argv: list[str] | None = None) -> int:
         except (ExtractError, PipelineValidationError) as exc:
             logging.getLogger("aimodels").error("%s", exc)
             return 1
-        print(f"ETL ok [{s.source}]: {s.n_valid} models loaded, {s.n_rejected} rejected -> {s.db_path}")
+        target = "Supabase" if s.db_path is None else s.db_path
+        print(f"ETL ok [{s.source}]: {s.n_valid} models loaded, {s.n_rejected} rejected -> {target}")
 
     if args.cmd in ("eda", "all"):
         from .eda import run_eda
