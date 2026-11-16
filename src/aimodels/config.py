@@ -1,5 +1,4 @@
 """Paths, endpoints and tunables in one place."""
-
 from __future__ import annotations
 
 import os
@@ -19,9 +18,12 @@ REPORTS_DIR = ROOT / "reports"
 MANUAL_HF_PATH = DATA_DIR / "manual_hf_ids.csv"
 HF_CACHE_PATH = RAW_DIR / "hf_cache.json"
 
+# --- Supabase / PostgreSQL ------------------------------------------------
+# Set SUPABASE_DB_URL to a full PostgreSQL connection string, e.g.:
+# postgresql://postgres:[PASSWORD]@db.[PROJECT].supabase.co:5432/postgres
+SUPABASE_DB_URL = os.environ.get("SUPABASE_DB_URL")
+
 # --- endpoints -------------------------------------------------------------
-# Artificial Analysis has documented two paths for its free LLM endpoint; we try
-# them in order and fall back on 403/404/410. Override with AA_URL if it changes.
 AA_ENDPOINTS: list[str] = (
     [os.environ["AA_URL"]]
     if os.environ.get("AA_URL")
