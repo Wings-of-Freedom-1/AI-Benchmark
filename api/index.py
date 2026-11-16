@@ -1,5 +1,7 @@
 """FastAPI adapter for Vercel with Supabase (Live) and SQLite (Demo)."""
 
+import datetime
+import decimal
 import os
 import sqlite3
 import time
@@ -37,15 +39,24 @@ def get_db(which: str):
         return conn
 
 
+def sanitize(val):
+    """Convert PostgreSQL Decimal/Date types to JSON-safe formats."""
+    if isinstance(val, decimal.Decimal):
+        return float(val)
+    if isinstance(val, (datetime.date, datetime.datetime)):
+        return val.isoformat()
+    return val
+
+
 def q(conn, sql: str) -> list[dict]:
-    """Helper to execute a query and return a list of dictionaries for both DBs."""
+    """Helper to execute a query and return a list of clean dictionaries for both DBs."""
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) if not isinstance(conn, sqlite3.Connection) else conn.cursor()
     cur.execute(sql)
     if isinstance(conn, sqlite3.Connection):
         cols = [d[0] for d in (cur.description or [])]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        return [dict(zip(cols, [sanitize(v) for v in r])) for r in cur.fetchall()]
     else:
-        return [dict(r) for r in cur.fetchall()]
+        return [{k: sanitize(v) for k, v in dict(r).items()} for r in cur.fetchall()]
 
 
 # ---------- HTML & static ----------
@@ -168,7 +179,7 @@ async def sql(request: Request):
         cols = [d[0] for d in (cur.description or [])]
         data = cur.fetchmany(SQL_ROW_LIMIT + 1)
         truncated = len(data) > SQL_ROW_LIMIT
-        data = [list(r) for r in data[:SQL_ROW_LIMIT]]
+        data = [[sanitize(v) for v in r] for r in data[:SQL_ROW_LIMIT]]
         return {"columns": cols, "rows": data, "truncated": truncated, "ms": round((time.time() - started) * 1000)}
     finally:
         conn.close()
@@ -178,12 +189,21 @@ async def sql(request: Request):
 _ETL_MSG = "Vercel Deployment: ETL is handled externally. Run `python -m aimodels all` locally to sync new data."
 
 @app.post("/api/run")
-async def run_disabled():
+async def run_disabled(request: Request):
+    body = await request.json()
+    db_name = str(body.get("dataset", "sample"))
+    try:
+        conn = get_db(db_name)
+        n = q(conn, "SELECT COUNT(*) AS n FROM models")[0]["n"]
+        conn.close()
+    except Exception:
+        n = 0
+        
     return JSONResponse(status_code=200, content={
         "id": "vercel-disabled", "kind": "etl", "status": "done", "stage": "done",
         "error": None, 
         "lines": [{"t": time.strftime("%H:%M:%S"), "lvl": "INFO", "msg": _ETL_MSG}],
-        "result": {"n_valid": 0, "n_rejected": 0}, 
+        "result": {"n_valid": n, "n_rejected": 0}, 
         "done_stages": ["extract", "transform", "validate", "load", "eda"],
         "params": {}, "started": time.time(), "finished": time.time(), "next": 1,
     })
