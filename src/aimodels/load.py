@@ -306,7 +306,7 @@ def load_all(
             )
             run_id = cur.fetchone()[0]
         else:
-            # For SQLite, cur.execute() returns the cursor which has the lastrowid
+            # FIX: cur.execute() returns the cursor, which has .lastrowid
             cursor = cur.execute(
                 "INSERT INTO pipeline_runs "
                 "(started_at, finished_at, source, n_aa, n_openrouter, n_hf, n_valid, n_rejected, stats_json) "
@@ -314,7 +314,6 @@ def load_all(
                 params,
             )
             run_id = cursor.lastrowid
-            run_id = cur.lastrowid
 
         # 5) rejects
         if len(rejects):
