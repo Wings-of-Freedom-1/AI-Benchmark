@@ -62,20 +62,23 @@ def q(conn, sql: str) -> list[dict]:
 
 def fix_pg_query(query: str) -> str:
     """Translates SQLite syntax to PostgreSQL syntax so frontend queries don't break."""
-    # 1. Fix ROUND() requiring NUMERIC cast
+    # 1. Hardcode the translation for the "Tables" button
+    if "sqlite_master" in query.lower():
+        return "SELECT table_name AS name, CASE WHEN table_type='VIEW' THEN 'view' ELSE 'table' END AS type FROM information_schema.tables WHERE table_schema='public' ORDER BY type, name"
+
+    # 2. Convert SQLite IFNULL to Postgres COALESCE
+    query = re.sub(r'IFNULL\(', 'COALESCE(', query, flags=re.IGNORECASE)
+
+    # 3. Convert SQLite strftime to Postgres EXTRACT
+    query = re.sub(r"strftime\(\s*'%Y'\s*,\s*(.*?)\s*\)", r"EXTRACT(YEAR FROM \1)", query, flags=re.IGNORECASE)
+    
+    # 4. Fix ROUND() requiring NUMERIC cast
     query = re.sub(r'ROUND\((.*?),\s*(\d+)\)', r'ROUND(CAST(\1 AS NUMERIC), \2)', query, flags=re.IGNORECASE | re.DOTALL)
     
-    # 2. Fix AVG() returning null (SQLite returns 0). Wraps in COALESCE.
+    # 5. Fix AVG() returning null (SQLite returns 0). Wraps in COALESCE.
     query = re.sub(r'AVG\((.*?)\)', r'COALESCE(AVG(\1), 0)', query, flags=re.IGNORECASE)
     
-    # 3. Fix sqlite_master for the Tables preset
-    if "sqlite_master" in query.lower():
-        query = re.sub(r'FROM\s+sqlite_master', 'FROM information_schema.tables', query, flags=re.IGNORECASE)
-        query = re.sub(r'\bname\b', 'table_name AS name', query, flags=re.IGNORECASE)
-        query = re.sub(r"type\s*=\s*'table'", "table_schema='public'", query, flags=re.IGNORECASE)
-        query = query.replace("table_name AS name AS name", "table_name AS name")
-        
-    # 4. Fix rowid (SQLite) -> ctid (Postgres)
+    # 6. Fix rowid (SQLite) -> ctid (Postgres)
     if "rowid" in query.lower():
         query = re.sub(r'\browid\b', 'ctid', query, flags=re.IGNORECASE)
         
@@ -213,6 +216,7 @@ async def sql(request: Request):
         data = [[sanitize(v) for v in r] for r in data[:SQL_ROW_LIMIT]]
         return {"columns": cols, "rows": data, "truncated": truncated, "ms": round((time.time() - started) * 1000)}
     except Exception as exc:
+        # If a preset still fails, show the exact PostgreSQL error in the UI
         raise HTTPException(status_code=400, detail=str(exc))
     finally:
         conn.close()
