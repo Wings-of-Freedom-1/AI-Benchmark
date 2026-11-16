@@ -66,19 +66,23 @@ def fix_pg_query(query: str) -> str:
     if "sqlite_master" in query.lower():
         return "SELECT table_name AS name, CASE WHEN table_type='VIEW' THEN 'view' ELSE 'table' END AS type FROM information_schema.tables WHERE table_schema='public' ORDER BY type, name"
 
-    # 2. Convert SQLite IFNULL to Postgres COALESCE
+    # 2. Fix the "Smallest per score" button (dynamic threshold instead of hardcoded 60)
+    if "intelligence_index >= 60" in query:
+        query = query.replace("intelligence_index >= 60", "intelligence_index >= (SELECT AVG(intelligence_index) FROM models)")
+
+    # 3. Convert SQLite IFNULL to Postgres COALESCE
     query = re.sub(r'IFNULL\(', 'COALESCE(', query, flags=re.IGNORECASE)
 
-    # 3. Convert SQLite strftime to Postgres EXTRACT
+    # 4. Convert SQLite strftime to Postgres EXTRACT
     query = re.sub(r"strftime\(\s*'%Y'\s*,\s*(.*?)\s*\)", r"EXTRACT(YEAR FROM \1)", query, flags=re.IGNORECASE)
     
-    # 4. Fix ROUND() requiring NUMERIC cast
+    # 5. Fix ROUND() requiring NUMERIC cast
     query = re.sub(r'ROUND\((.*?),\s*(\d+)\)', r'ROUND(CAST(\1 AS NUMERIC), \2)', query, flags=re.IGNORECASE | re.DOTALL)
     
-    # 5. Fix AVG() returning null (SQLite returns 0). Wraps in COALESCE.
+    # 6. Fix AVG() returning null (SQLite returns 0). Wraps in COALESCE.
     query = re.sub(r'AVG\((.*?)\)', r'COALESCE(AVG(\1), 0)', query, flags=re.IGNORECASE)
     
-    # 6. Fix rowid (SQLite) -> ctid (Postgres)
+    # 7. Fix rowid (SQLite) -> ctid (Postgres)
     if "rowid" in query.lower():
         query = re.sub(r'\browid\b', 'ctid', query, flags=re.IGNORECASE)
         
@@ -216,7 +220,6 @@ async def sql(request: Request):
         data = [[sanitize(v) for v in r] for r in data[:SQL_ROW_LIMIT]]
         return {"columns": cols, "rows": data, "truncated": truncated, "ms": round((time.time() - started) * 1000)}
     except Exception as exc:
-        # If a preset still fails, show the exact PostgreSQL error in the UI
         raise HTTPException(status_code=400, detail=str(exc))
     finally:
         conn.close()
